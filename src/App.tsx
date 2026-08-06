@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import {
   Area,
   AreaChart,
@@ -8,7 +8,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
-import { ChevronRight, Sparkles } from 'lucide-react'
+import { ChevronRight, RefreshCw, Search, Sparkles } from 'lucide-react'
 import { Header } from './components/Header'
 import { Footer } from './components/Footer'
 import { StatCard } from './components/StatCard'
@@ -23,8 +23,12 @@ const docsLinks = [
   { label: 'Trading Bot Guide', href: 'https://docs.loafmarkets.com/en/guides/building-a-trading-bot/' },
 ]
 
+type SortOption = 'volume' | 'apr' | 'price-high' | 'price-low'
+
 function App() {
-  const { markets, loading, error, totalMarkets, supportedChains, tvl, apr } = useMarkets(30000)
+  const { markets, loading, error, totalMarkets, supportedChains, tvl, apr, refetch } = useMarkets(30000)
+  const [query, setQuery] = useState('')
+  const [sortBy, setSortBy] = useState<SortOption>('volume')
   const chartMarket = markets[0]
 
   const chartData = useMemo(() => {
@@ -34,10 +38,26 @@ function App() {
     })) ?? []
   }, [chartMarket])
 
+  const filteredMarkets = useMemo(() => {
+    const normalizedQuery = query.trim().toLowerCase()
+    const nextMarkets = markets.filter((market) => {
+      if (!normalizedQuery) return true
+      return [market.assetName, market.tokenName, market.ticker, market.country, market.streetAddress]
+        .some((value) => value.toLowerCase().includes(normalizedQuery))
+    })
+
+    return [...nextMarkets].sort((a, b) => {
+      if (sortBy === 'apr') return b.rentalYieldPercentage - a.rentalYieldPercentage
+      if (sortBy === 'price-high') return b.marketPrice - a.marketPrice
+      if (sortBy === 'price-low') return a.marketPrice - b.marketPrice
+      return b.volume24h - a.volume24h
+    })
+  }, [markets, query, sortBy])
+
   const statItems = [
     { label: 'Live TVL', value: `$${tvl.toLocaleString(undefined, { maximumFractionDigits: 0 })}`, detail: 'Aggregated market value' },
     { label: 'Total Markets', value: `${totalMarkets}`, detail: 'Tradeable properties' },
-    { label: 'Supported Chains', value: `${supportedChains}`, detail: 'Country market coverage' },
+    { label: 'Market Countries', value: `${supportedChains}`, detail: 'Geographic coverage' },
     { label: 'Average APR', value: `${apr.toFixed(2)}%`, detail: 'Based on rental yields' },
   ]
 
@@ -53,7 +73,7 @@ function App() {
             </div>
             <h1>Community-built, unofficial toolkit for Loaf Markets.</h1>
             <p className="hero-copy">
-              Monitor live property markets, TVL, APR and chain coverage with refresh every 30 seconds. This dashboard pulls data from the official Loaf Markets API.
+              Monitor live property markets, TVL, APR and geographic coverage with automatic refresh every 30 seconds.
             </p>
             <div className="hero-actions">
               {docsLinks.map((link) => (
@@ -67,7 +87,7 @@ function App() {
           <div className="hero-meta">
             <div className="meta-card">
               <p>Live market snapshot</p>
-              <strong>{loading ? 'Refreshing every 30 seconds' : 'Connected to Loaf API'}</strong>
+              <strong>{loading ? 'Refreshing market data' : 'Connected to Loaf API'}</strong>
             </div>
           </div>
         </section>
@@ -86,12 +106,13 @@ function App() {
               <p>7-day live activity</p>
               <h2>{chartMarket ? `${chartMarket.assetName} performance` : 'Market performance'}</h2>
             </div>
-            <button type="button" className="secondary-button" onClick={() => window.location.reload()}>
-              Refresh now
+            <button type="button" className="secondary-button refresh-button" onClick={refetch} disabled={loading}>
+              <RefreshCw size={16} className={loading ? 'spin' : ''} />
+              {loading ? 'Refreshing' : 'Refresh data'}
             </button>
           </div>
 
-          {loading ? (
+          {loading && markets.length === 0 ? (
             <Loading />
           ) : (
             <div className="chart-wrapper">
@@ -115,15 +136,34 @@ function App() {
         </section>
 
         <section className="market-panel">
-          <div className="panel-heading">
+          <div className="panel-heading market-heading">
             <div>
-              <p>Market cards</p>
-              <h2>Live property listings</h2>
+              <p>Market explorer</p>
+              <h2>Search and compare live properties</h2>
             </div>
+            <span className="result-count">{filteredMarkets.length} results</span>
+          </div>
+
+          <div className="market-toolbar">
+            <label className="search-field">
+              <Search size={18} />
+              <input
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="Search property, ticker, country or address"
+                aria-label="Search markets"
+              />
+            </label>
+            <select value={sortBy} onChange={(event) => setSortBy(event.target.value as SortOption)} aria-label="Sort markets">
+              <option value="volume">Highest 24h volume</option>
+              <option value="apr">Highest rental yield</option>
+              <option value="price-high">Highest price</option>
+              <option value="price-low">Lowest price</option>
+            </select>
           </div>
 
           <div className="market-grid">
-            {loading ? (
+            {loading && markets.length === 0 ? (
               Array.from({ length: 4 }).map((_, index) => (
                 <div key={index} className="market-card skeleton-card">
                   <div className="loading-line short" />
@@ -131,8 +171,15 @@ function App() {
                   <div className="loading-line" />
                 </div>
               ))
+            ) : filteredMarkets.length > 0 ? (
+              filteredMarkets.slice(0, 8).map((market) => <MarketCard key={market.propertyId} market={market} />)
             ) : (
-              markets.slice(0, 4).map((market) => <MarketCard key={market.propertyId} market={market} />)
+              <div className="empty-state">
+                <Search size={28} />
+                <h3>No markets found</h3>
+                <p>Try another property name, ticker, country or address.</p>
+                <button type="button" className="secondary-button" onClick={() => setQuery('')}>Clear search</button>
+              </div>
             )}
           </div>
         </section>
@@ -146,91 +193,38 @@ function App() {
           </div>
 
           <div className="orderbook-grid">
-            <div>
-              <div className="orderbook-heading">Bids</div>
-              <div className="order-table">
-                <div className="order-row order-row-header">
-                  <span>Price</span>
-                  <span>Size</span>
-                  <span>Total</span>
-                </div>
-                {chartMarket ? (
-                  [1, 2, 3, 4].map((level) => {
-                    const price = chartMarket.marketPrice - level * 0.45
-                    const size = Number((12 - level * 1.5).toFixed(2))
+            {['Bids', 'Asks'].map((side) => (
+              <div key={side}>
+                <div className="orderbook-heading">{side}</div>
+                <div className="order-table">
+                  <div className="order-row order-row-header"><span>Price</span><span>Size</span><span>Total</span></div>
+                  {chartMarket && [1, 2, 3, 4].map((level) => {
+                    const isBid = side === 'Bids'
+                    const price = chartMarket.marketPrice + (isBid ? -level * 0.45 : level * 0.55)
+                    const size = Number((isBid ? 12 - level * 1.5 : 8 + level * 1.2).toFixed(2))
                     return (
-                      <div key={level} className="order-row bid-row">
-                        <span>${price.toFixed(2)}</span>
-                        <span>{size}</span>
-                        <span>{(price * size).toFixed(2)}</span>
+                      <div key={level} className={`order-row ${isBid ? 'bid-row' : 'ask-row'}`}>
+                        <span>${price.toFixed(2)}</span><span>{size}</span><span>{(price * size).toFixed(2)}</span>
                       </div>
                     )
-                  })
-                ) : (
-                  Array.from({ length: 4 }).map((_, index) => (
-                    <div key={index} className="order-row bid-row skeleton-row">
-                      <span className="loading-line tiny" />
-                      <span className="loading-line tiny" />
-                      <span className="loading-line tiny" />
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-
-            <div>
-              <div className="orderbook-heading">Asks</div>
-              <div className="order-table">
-                <div className="order-row order-row-header">
-                  <span>Price</span>
-                  <span>Size</span>
-                  <span>Total</span>
+                  })}
                 </div>
-                {chartMarket ? (
-                  [1, 2, 3, 4].map((level) => {
-                    const price = chartMarket.marketPrice + level * 0.55
-                    const size = Number((8 + level * 1.2).toFixed(2))
-                    return (
-                      <div key={level} className="order-row ask-row">
-                        <span>${price.toFixed(2)}</span>
-                        <span>{size}</span>
-                        <span>{(price * size).toFixed(2)}</span>
-                      </div>
-                    )
-                  })
-                ) : (
-                  Array.from({ length: 4 }).map((_, index) => (
-                    <div key={index} className="order-row ask-row skeleton-row">
-                      <span className="loading-line tiny" />
-                      <span className="loading-line tiny" />
-                      <span className="loading-line tiny" />
-                    </div>
-                  ))
-                )}
               </div>
-            </div>
+            ))}
           </div>
         </section>
 
         <section className="resources-panel" id="resources">
-          <div className="panel-heading">
-            <div>
-              <p>Resources</p>
-              <h2>Official Loaf Markets docs</h2>
-            </div>
-          </div>
+          <div className="panel-heading"><div><p>Resources</p><h2>Official Loaf Markets docs</h2></div></div>
           <div className="resources-grid">
             {docsLinks.map((link) => (
               <a key={link.href} href={link.href} target="_blank" rel="noreferrer" className="resource-card">
-                <span>{link.label}</span>
-                <ChevronRight size={18} />
+                <span>{link.label}</span><ChevronRight size={18} />
               </a>
             ))}
           </div>
           <div className="security-note">
-            <p>
-              Security notice: this interface never asks for private keys. Authenticated trading calls should not be made directly from the browser.
-            </p>
+            <p>Security notice: this interface never asks for private keys. Authenticated trading calls should not be made directly from the browser.</p>
           </div>
         </section>
       </main>
