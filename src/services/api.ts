@@ -1,17 +1,22 @@
 import type { TradeResponse } from '../types'
 
-const BASE_URL = 'https://api.loafmarkets.com'
-
 export async function fetchMarkets(): Promise<TradeResponse> {
-  const response = await fetch(`${BASE_URL}/api/trade`, {
+  const snapshotUrl = `${import.meta.env.BASE_URL}markets.json?ts=${Date.now()}`
+  const response = await fetch(snapshotUrl, {
     headers: {
       Accept: 'application/json',
     },
+    cache: 'no-store',
   })
 
   if (!response.ok) {
-    throw new Error(`Failed to load market data: ${response.statusText}`)
+    throw new Error(`Failed to load synced market data: ${response.statusText}`)
   }
 
-  return response.json()
+  const data = await response.json()
+  if (!data || !Array.isArray(data.properties)) {
+    throw new Error('Synced market data has an unexpected format')
+  }
+
+  return data
 }
