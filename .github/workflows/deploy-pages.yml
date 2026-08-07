@@ -3,6 +3,8 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [main]
+  schedule:
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -29,6 +31,15 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Fetch Loaf market snapshot
+        run: |
+          mkdir -p public
+          curl --fail --silent --show-error --retry 3 \
+            --header 'Accept: application/json' \
+            'https://api.loafmarkets.com/api/trade' \
+            --output public/markets.json
+          node -e "const fs=require('fs'); const d=JSON.parse(fs.readFileSync('public/markets.json','utf8')); if(!Array.isArray(d.properties)) throw new Error('Unexpected Loaf API response'); console.log('Synced markets:', d.properties.length)"
 
       - name: Build
         run: npm run build
