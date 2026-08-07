@@ -90,6 +90,118 @@
   color: #fff3d2;
 }
 
+.market-view-toggle {
+  display: inline-flex;
+  gap: 8px;
+  padding: 6px;
+  margin-bottom: 18px;
+  border-radius: 999px;
+  background: rgba(255, 225, 150, 0.06);
+  border: 1px solid rgba(255, 209, 116, 0.12);
+}
+
+.market-view-toggle button {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 0;
+  border-radius: 999px;
+  padding: 9px 14px;
+  background: transparent;
+  color: #cdbc90;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.market-view-toggle button.active {
+  background: rgba(255, 209, 116, 0.15);
+  color: #fff3d2;
+}
+
+.interactive-market-card {
+  position: relative;
+  overflow: hidden;
+  transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.interactive-market-card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(255, 209, 116, 0.28);
+}
+
+.selected-market-card {
+  border-color: rgba(255, 216, 132, 0.48);
+  box-shadow: 0 0 0 2px rgba(255, 209, 116, 0.08), 0 24px 50px rgba(0, 0, 0, 0.24);
+}
+
+.market-card-select {
+  width: 100%;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.favorite-button {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 2;
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 209, 116, 0.16);
+  background: rgba(18, 13, 7, 0.88);
+  color: #c8b98e;
+  cursor: pointer;
+}
+
+.favorite-button:hover,
+.favorite-button.is-favorite {
+  color: #ffd884;
+  border-color: rgba(255, 216, 132, 0.36);
+}
+
+.market-card-header {
+  padding-right: 48px;
+}
+
+.market-card-footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(255, 209, 116, 0.09);
+  color: #bfae83;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.selected-market-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.selected-market-summary span,
+.selected-market-summary strong {
+  padding: 8px 12px;
+  border-radius: 999px;
+  background: rgba(255, 209, 116, 0.08);
+  color: #dbc99b;
+  font-size: 0.84rem;
+}
+
+.selected-market-summary strong {
+  color: #fff2c7;
+}
+
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
@@ -101,5 +213,14 @@
 
   .market-heading {
     align-items: flex-start;
+  }
+
+  .market-view-toggle {
+    width: 100%;
+  }
+
+  .market-view-toggle button {
+    flex: 1;
+    justify-content: center;
   }
 }
