@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   Area,
   AreaChart,
@@ -8,7 +8,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
-import { ChevronRight, RefreshCw, Search, Sparkles } from 'lucide-react'
+import { ChevronRight, Heart, RefreshCw, Search, Sparkles } from 'lucide-react'
 import { Header } from './components/Header'
 import { Footer } from './components/Footer'
 import { StatCard } from './components/StatCard'
@@ -16,6 +16,7 @@ import { MarketCard } from './components/MarketCard'
 import { Loading } from './components/Loading'
 import { ErrorBanner } from './components/ErrorBanner'
 import { useMarkets } from './hooks/useMarkets'
+import type { PropertyMarket } from './types'
 
 const docsLinks = [
   { label: 'Official Documentation', href: 'https://docs.loafmarkets.com/en/' },
@@ -24,12 +25,32 @@ const docsLinks = [
 ]
 
 type SortOption = 'volume' | 'apr' | 'price-high' | 'price-low'
+type ViewOption = 'all' | 'favorites'
+
+const FAVORITES_KEY = 'loaf-builder-favorites'
 
 function App() {
   const { markets, loading, error, totalMarkets, supportedChains, tvl, apr, refetch } = useMarkets(30000)
   const [query, setQuery] = useState('')
   const [sortBy, setSortBy] = useState<SortOption>('volume')
-  const chartMarket = markets[0]
+  const [view, setView] = useState<ViewOption>('all')
+  const [selectedMarketId, setSelectedMarketId] = useState<number | null>(null)
+  const [favoriteIds, setFavoriteIds] = useState<number[]>(() => {
+    try {
+      const stored = window.localStorage.getItem(FAVORITES_KEY)
+      return stored ? JSON.parse(stored) : []
+    } catch {
+      return []
+    }
+  })
+
+  useEffect(() => {
+    window.localStorage.setItem(FAVORITES_KEY, JSON.stringify(favoriteIds))
+  }, [favoriteIds])
+
+  const chartMarket = useMemo(() => {
+    return markets.find((market) => market.propertyId === selectedMarketId) ?? markets[0]
+  }, [markets, selectedMarketId])
 
   const chartData = useMemo(() => {
     return chartMarket?.candlesticks.slice(-7).map((candle) => ({
@@ -41,6 +62,7 @@ function App() {
   const filteredMarkets = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase()
     const nextMarkets = markets.filter((market) => {
+      if (view === 'favorites' && !favoriteIds.includes(market.propertyId)) return false
       if (!normalizedQuery) return true
       return [market.assetName, market.tokenName, market.ticker, market.country, market.streetAddress]
         .some((value) => value.toLowerCase().includes(normalizedQuery))
@@ -52,7 +74,20 @@ function App() {
       if (sortBy === 'price-low') return a.marketPrice - b.marketPrice
       return b.volume24h - a.volume24h
     })
-  }, [markets, query, sortBy])
+  }, [markets, query, sortBy, view, favoriteIds])
+
+  const handleSelectMarket = (market: PropertyMarket) => {
+    setSelectedMarketId(market.propertyId)
+    document.getElementById('markets')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
+
+  const toggleFavorite = (propertyId: number) => {
+    setFavoriteIds((current) => (
+      current.includes(propertyId)
+        ? current.filter((id) => id !== propertyId)
+        : [...current, propertyId]
+    ))
+  }
 
   const statItems = [
     { label: 'Live TVL', value: `$${tvl.toLocaleString(undefined, { maximumFractionDigits: 0 })}`, detail: 'Aggregated market value' },
@@ -112,6 +147,15 @@ function App() {
             </button>
           </div>
 
+          {chartMarket && (
+            <div className="selected-market-summary">
+              <span>{chartMarket.ticker}</span>
+              <strong>${chartMarket.marketPrice.toFixed(2)}</strong>
+              <span>{(chartMarket.rentalYieldPercentage * 100).toFixed(2)}% APR</span>
+              <span>{chartMarket.country}</span>
+            </div>
+          )}
+
           {loading && markets.length === 0 ? (
             <Loading />
           ) : (
@@ -144,6 +188,13 @@ function App() {
             <span className="result-count">{filteredMarkets.length} results</span>
           </div>
 
+          <div className="market-view-toggle" aria-label="Market view">
+            <button type="button" className={view === 'all' ? 'active' : ''} onClick={() => setView('all')}>All markets</button>
+            <button type="button" className={view === 'favorites' ? 'active' : ''} onClick={() => setView('favorites')}>
+              <Heart size={15} fill={view === 'favorites' ? 'currentColor' : 'none'} /> Favorites ({favoriteIds.length})
+            </button>
+          </div>
+
           <div className="market-toolbar">
             <label className="search-field">
               <Search size={18} />
@@ -172,13 +223,26 @@ function App() {
                 </div>
               ))
             ) : filteredMarkets.length > 0 ? (
-              filteredMarkets.slice(0, 8).map((market) => <MarketCard key={market.propertyId} market={market} />)
+              filteredMarkets.slice(0, 8).map((market) => (
+                <MarketCard
+                  key={market.propertyId}
+                  market={market}
+                  selected={chartMarket?.propertyId === market.propertyId}
+                  favorite={favoriteIds.includes(market.propertyId)}
+                  onSelect={handleSelectMarket}
+                  onToggleFavorite={toggleFavorite}
+                />
+              ))
             ) : (
               <div className="empty-state">
-                <Search size={28} />
-                <h3>No markets found</h3>
-                <p>Try another property name, ticker, country or address.</p>
-                <button type="button" className="secondary-button" onClick={() => setQuery('')}>Clear search</button>
+                {view === 'favorites' ? <Heart size={28} /> : <Search size={28} />}
+                <h3>{view === 'favorites' ? 'No favorite markets yet' : 'No markets found'}</h3>
+                <p>{view === 'favorites' ? 'Tap the heart on a market card to build your watchlist.' : 'Try another property name, ticker, country or address.'}</p>
+                {view === 'favorites' ? (
+                  <button type="button" className="secondary-button" onClick={() => setView('all')}>Browse markets</button>
+                ) : (
+                  <button type="button" className="secondary-button" onClick={() => setQuery('')}>Clear search</button>
+                )}
               </div>
             )}
           </div>
@@ -188,7 +252,7 @@ function App() {
           <div className="panel-heading">
             <div>
               <p>Order Book</p>
-              <h2>Sample bid / ask levels</h2>
+              <h2>{chartMarket ? `${chartMarket.ticker} sample bid / ask levels` : 'Sample bid / ask levels'}</h2>
             </div>
           </div>
 
