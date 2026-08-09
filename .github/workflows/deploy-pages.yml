@@ -26,19 +26,32 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
 
       - name: Install dependencies
         run: npm ci
 
       - name: Fetch Loaf market snapshot
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p public
-          curl --fail --silent --show-error --retry 3 \
+
+          if curl --fail --silent --show-error \
+            --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 30 \
             --header 'Accept: application/json' \
             'https://api.loafmarkets.com/api/trade' \
-            --output public/markets.json
+            --output public/markets.json; then
+            echo 'Fetched fresh Loaf market snapshot.'
+          else
+            echo 'Loaf API unavailable; attempting to reuse the last deployed snapshot.'
+            curl --fail --silent --show-error \
+              --connect-timeout 10 --max-time 30 \
+              'https://kejan2514.github.io/loaf-builder-toolkit/markets.json' \
+              --output public/markets.json
+          fi
+
           node -e "const fs=require('fs'); const d=JSON.parse(fs.readFileSync('public/markets.json','utf8')); if(!Array.isArray(d.properties)) throw new Error('Unexpected Loaf API response'); console.log('Synced markets:', d.properties.length)"
 
       - name: Build
