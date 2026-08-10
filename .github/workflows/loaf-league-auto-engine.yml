@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     # Round 1: 2026-08-13 02:00 UTC through 2026-08-18 02:00 UTC.
-    # Guarded sessions run every 5 minutes; the final 02:00-02:10 window performs cleanup only.
+    # Run a guarded session every 5 minutes; the final 02:00 hour performs cleanup only.
     - cron: '*/5 * 13-17 8 *'
     - cron: '*/5 0-2 18 8 *'
 
@@ -26,18 +26,25 @@ jobs:
           python-version: '3.12'
       - name: Install dependency
         run: pip install 'httpx>=0.27,<1'
-      - name: Run hardened autonomous competition engine
+      - name: Run Round 1 maker-first hybrid volume engine
         env:
           LOAF_API_KEY: ${{ secrets.LOAF_API_TOKEN }}
           LOAF_API_BASE: https://api.loafmarkets.com
           LOAF_TOKEN_NAME: terafab
-          LOAF_ENGINE_BASE_NOTIONAL: '200'
-          LOAF_ENGINE_MAX_NOTIONAL: '500'
-          LOAF_ENGINE_MAX_SPREAD_PCT: '1.5'
-          LOAF_ENGINE_QUOTE_IMPROVEMENT_BPS: '1'
-          LOAF_ENGINE_REST_SECONDS: '8'
-          LOAF_ENGINE_COOLDOWN_SECONDS: '3'
+          # Published 5x multiplier begins at $30M traded volume. Aim above it for buffer.
+          LOAF_ENGINE_ROUND_VOLUME_TARGET: '35000000'
           LOAF_ENGINE_SESSION_BUDGET_SECONDS: '210'
+          # Maker-first because Round 1 publishes maker 0% / taker 0.1% fees.
+          LOAF_ENGINE_MAKER_NOTIONAL: '3000'
+          LOAF_ENGINE_TAKER_NOTIONAL: '1250'
+          LOAF_ENGINE_MAX_TAKER_NOTIONAL: '2000'
+          LOAF_ENGINE_MAX_MAKER_SPREAD_PCT: '1.0'
+          # Only use taker round-trips when spread is extremely tight to protect the $100k mock capital.
+          LOAF_ENGINE_MAX_TAKER_SPREAD_PCT: '0.10'
+          LOAF_ENGINE_QUOTE_IMPROVEMENT_BPS: '1'
+          LOAF_ENGINE_MAKER_REST_SECONDS: '5'
+          LOAF_ENGINE_COOLDOWN_SECONDS: '1.5'
           LOAF_ENGINE_MAX_ERRORS: '3'
           LOAF_ENGINE_MAX_EMPTY_BOOKS: '12'
+          LOAF_ENGINE_DEPTH_FRACTION: '0.30'
         run: python league-bot/competition_engine.py
