@@ -1,0 +1,44 @@
+name: Loaf League Bot - Guarded Live Pilot
+
+on:
+  workflow_dispatch:
+    inputs:
+      enable_live:
+        description: 'Set true only for the supervised tiny live pilot'
+        required: true
+        default: false
+        type: boolean
+      side:
+        description: 'Pilot side'
+        required: true
+        default: 'BUY'
+        type: choice
+        options:
+          - BUY
+          - SELL
+
+permissions:
+  contents: read
+
+jobs:
+  guarded-live-pilot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependency
+        run: pip install 'httpx>=0.27,<1'
+      - name: Run guarded tiny live pilot
+        env:
+          LOAF_API_KEY: ${{ secrets.LOAF_API_TOKEN }}
+          LOAF_API_BASE: https://api.loafmarkets.com
+          LOAF_TOKEN_NAME: terafab
+          LOAF_ENABLE_LIVE: ${{ inputs.enable_live }}
+          LOAF_LIVE_CONFIRM: RUN_TINY_LIVE_PILOT
+          LOAF_LIVE_SIDE: ${{ inputs.side }}
+          LOAF_LIVE_MAX_NOTIONAL: '25'
+          LOAF_LIVE_PILOT_SECONDS: '15'
+        run: python league-bot/live_pilot.py
