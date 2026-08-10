@@ -1,0 +1,34 @@
+name: Loaf League Bot - Dry Run
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'league-bot/dry_run.py'
+      - '.github/workflows/loaf-league-dry-run.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependency
+        run: pip install 'httpx>=0.27,<1'
+      - name: Read Loaf market/account state and generate dry-run decision
+        env:
+          LOAF_API_KEY: ${{ secrets.LOAF_API_TOKEN }}
+          LOAF_API_BASE: https://api.loafmarkets.com
+          LOAF_TOKEN_NAME: terafab
+          LOAF_ORDER_SIZE: '2'
+          LOAF_MAX_NOTIONAL_PER_ORDER: '1500'
+          LOAF_MAX_SPREAD_PCT: '1.5'
+          LOAF_QUOTE_OFFSET_BPS: '2'
+        run: python league-bot/dry_run.py
