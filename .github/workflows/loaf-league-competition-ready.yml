@@ -1,0 +1,29 @@
+name: Loaf League Bot - Competition Ready
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Round 1 starts 2026-08-13 02:00 UTC (05:00 Turkey time).
+    # Probe every 5 minutes during the launch window. The script itself is read-only.
+    - cron: '*/5 1-7 13 8 *'
+
+permissions:
+  contents: read
+
+jobs:
+  competition-ready:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependency
+        run: pip install 'httpx>=0.27,<1'
+      - name: Check Terafab competition readiness
+        env:
+          LOAF_API_KEY: ${{ secrets.LOAF_API_TOKEN }}
+          LOAF_API_BASE: https://api.loafmarkets.com
+          LOAF_TOKEN_NAME: terafab
+        run: python league-bot/competition_ready.py
