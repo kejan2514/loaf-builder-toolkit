@@ -14,38 +14,57 @@ MARKET = os.getenv("LOAF_TOKEN_NAME", "terafab").lower()
 START_UTC = datetime(2026, 8, 13, 2, 0, 0, tzinfo=timezone.utc)
 END_UTC = datetime(2026, 8, 18, 2, 0, 0, tzinfo=timezone.utc)
 
-BASE_NOTIONAL = float(os.getenv("LOAF_ENGINE_BASE_NOTIONAL", "200"))
-MAX_NOTIONAL = float(os.getenv("LOAF_ENGINE_MAX_NOTIONAL", "500"))
-MAX_SPREAD_PCT = float(os.getenv("LOAF_ENGINE_MAX_SPREAD_PCT", "1.5"))
-QUOTE_IMPROVEMENT_BPS = float(os.getenv("LOAF_ENGINE_QUOTE_IMPROVEMENT_BPS", "1"))
-REST_SECONDS = int(os.getenv("LOAF_ENGINE_REST_SECONDS", "8"))
-COOLDOWN_SECONDS = int(os.getenv("LOAF_ENGINE_COOLDOWN_SECONDS", "3"))
+# Round 1 is volume-maxxing. 30M+ is the published 5x multiplier tier.
+# Aim slightly above it so ordinary downtime does not immediately drop us below pace.
+ROUND_VOLUME_TARGET = float(os.getenv("LOAF_ENGINE_ROUND_VOLUME_TARGET", "35000000"))
 SESSION_BUDGET_SECONDS = int(os.getenv("LOAF_ENGINE_SESSION_BUDGET_SECONDS", "210"))
+
+# Maker-first: maker fee is 0%; taker is used only to stay on target pace in a tight book.
+MAKER_NOTIONAL = float(os.getenv("LOAF_ENGINE_MAKER_NOTIONAL", "3000"))
+TAKER_NOTIONAL = float(os.getenv("LOAF_ENGINE_TAKER_NOTIONAL", "1250"))
+MAX_TAKER_NOTIONAL = float(os.getenv("LOAF_ENGINE_MAX_TAKER_NOTIONAL", "2000"))
+MAX_MAKER_SPREAD_PCT = float(os.getenv("LOAF_ENGINE_MAX_MAKER_SPREAD_PCT", "1.0"))
+MAX_TAKER_SPREAD_PCT = float(os.getenv("LOAF_ENGINE_MAX_TAKER_SPREAD_PCT", "0.10"))
+QUOTE_IMPROVEMENT_BPS = float(os.getenv("LOAF_ENGINE_QUOTE_IMPROVEMENT_BPS", "1"))
+MAKER_REST_SECONDS = int(os.getenv("LOAF_ENGINE_MAKER_REST_SECONDS", "5"))
+COOLDOWN_SECONDS = float(os.getenv("LOAF_ENGINE_COOLDOWN_SECONDS", "1.5"))
 MAX_ERRORS = int(os.getenv("LOAF_ENGINE_MAX_ERRORS", "3"))
 MAX_EMPTY_BOOKS = int(os.getenv("LOAF_ENGINE_MAX_EMPTY_BOOKS", "12"))
+DEPTH_FRACTION = float(os.getenv("LOAF_ENGINE_DEPTH_FRACTION", "0.30"))
 
 
 def log(payload: dict) -> None:
     print(json.dumps(payload, separators=(",", ":"), default=str), flush=True)
 
 
+def fnum(value, default: float = 0.0) -> float:
+    try:
+        return float(value or default)
+    except (TypeError, ValueError):
+        return default
+
+
 def level_price(level) -> float:
     if isinstance(level, dict):
         for key in ("price", "px", "p"):
             if key in level:
-                try:
-                    return float(level.get(key) or 0)
-                except (TypeError, ValueError):
-                    return 0.0
+                return fnum(level.get(key))
     if isinstance(level, (list, tuple)) and level:
-        try:
-            return float(level[0])
-        except (TypeError, ValueError):
-            return 0.0
+        return fnum(level[0])
     return 0.0
 
 
-def read_market(client: httpx.Client) -> tuple[dict, int | None, float, float, int, int]:
+def level_qty(level) -> float:
+    if isinstance(level, dict):
+        for key in ("quantity", "qty", "size", "amount", "q"):
+            if key in level:
+                return fnum(level.get(key))
+    if isinstance(level, (list, tuple)) and len(level) > 1:
+        return fnum(level[1])
+    return 0.0
+
+
+def read_market(client: httpx.Client) -> tuple[dict, int | None, float, float, float, float, int, int]:
     h = client.get(f"{BASE}/api/info/{MARKET}/header")
     h.raise_for_status()
     header = h.json()
@@ -63,11 +82,24 @@ def read_market(client: httpx.Client) -> tuple[dict, int | None, float, float, i
     book = trade.get("orderBook") if isinstance(trade, dict) else None
     bids_raw = (book.get("bids") or []) if isinstance(book, dict) else []
     asks_raw = (book.get("asks") or []) if isinstance(book, dict) else []
-    bids = [p for p in (level_price(x) for x in bids_raw) if p > 0]
-    asks = [p for p in (level_price(x) for x in asks_raw) if p > 0]
-    bid = max(bids) if bids else 0.0
-    ask = min(asks) if asks else 0.0
-    return trade, int(property_id) if property_id is not None else None, bid, ask, len(bids_raw), len(asks_raw)
+
+    bids = [(level_price(x), level_qty(x)) for x in bids_raw]
+    asks = [(level_price(x), level_qty(x)) for x in asks_raw]
+    bids = [(p, q) for p, q in bids if p > 0]
+    asks = [(p, q) for p, q in asks if p > 0]
+    best_bid, bid_qty = max(bids, key=lambda x: x[0]) if bids else (0.0, 0.0)
+    best_ask, ask_qty = min(asks, key=lambda x: x[0]) if asks else (0.0, 0.0)
+
+    return (
+        trade,
+        int(property_id) if property_id is not None else None,
+        best_bid,
+        best_ask,
+        bid_qty,
+        ask_qty,
+        len(bids_raw),
+        len(asks_raw),
+    )
 
 
 def active_orders(client: httpx.Client) -> list[dict]:
@@ -76,18 +108,19 @@ def active_orders(client: httpx.Client) -> list[dict]:
     raw = r.json()
     if isinstance(raw, list):
         return [x for x in raw if isinstance(x, dict)]
-    if isinstance(raw, dict) and isinstance(raw.get("orders"), list):
-        return [x for x in raw["orders"] if isinstance(x, dict)]
+    if isinstance(raw, dict):
+        for key in ("activeOrders", "orders", "data"):
+            if isinstance(raw.get(key), list):
+                return [x for x in raw[key] if isinstance(x, dict)]
     return []
 
 
 def cancel_order(client: httpx.Client, order_id) -> bool:
     r = client.post(f"{BASE}/api/orders/cancel", json={"orderId": order_id})
     if r.status_code == 404:
-        log({"event": "CANCEL_ALREADY_GONE", "orderId": order_id})
         return True
     r.raise_for_status()
-    log({"event": "CANCEL", "orderId": order_id, "response": r.json()})
+    log({"event": "CANCEL", "orderId": order_id})
     return True
 
 
@@ -105,82 +138,150 @@ def cancel_all_active(client: httpx.Client) -> int:
     return count
 
 
-def adaptive_notional(spread_pct: float, elapsed_ratio: float) -> float:
-    # Stay conservative in noisy books; use the configured ceiling only when the book is tight.
-    amount = BASE_NOTIONAL
-    if spread_pct <= 0.20:
-        amount *= 1.75
-    elif spread_pct <= 0.50:
-        amount *= 1.40
-    elif spread_pct <= 0.90:
-        amount *= 1.15
-
-    # Gradually use more of the configured risk budget later in the round, never above MAX_NOTIONAL.
-    if elapsed_ratio >= 0.75:
-        amount *= 1.15
-    elif elapsed_ratio >= 0.50:
-        amount *= 1.08
-    return max(10.0, min(MAX_NOTIONAL, amount))
+def fresh_nonce(client: httpx.Client) -> tuple[str | None, dict | None]:
+    r = client.post(f"{BASE}/api/orders/nonce")
+    if r.status_code == 403:
+        return None, {"status": "TRADING_GATE_CLOSED", "httpStatus": 403, "body": r.text[:300]}
+    r.raise_for_status()
+    data = r.json()
+    nonce = data.get("nonce") if isinstance(data, dict) else None
+    if not nonce:
+        return None, {"status": "ERROR", "reason": "nonce_missing"}
+    return str(nonce), None
 
 
-def passive_price(side: str, bid: float, ask: float) -> float:
-    mid = (bid + ask) / 2
-    improve = QUOTE_IMPROVEMENT_BPS / 10_000
-    if side == "BUY":
-        proposed = bid * (1 + improve)
-        return min(proposed, mid * (1 - 0.00001), ask * (1 - 0.00001))
-    proposed = ask * (1 - improve)
-    return max(proposed, mid * (1 + 0.00001), bid * (1 + 0.00001))
-
-
-def place_passive_order(
+def place_order(
     client: httpx.Client,
     property_id: int,
     side: str,
-    price: float,
-    notional: float,
+    quantity: float,
+    order_type: str,
+    price: float = 0.0,
 ) -> dict:
-    nonce_r = client.post(f"{BASE}/api/orders/nonce")
-    if nonce_r.status_code == 403:
-        return {"status": "TRADING_GATE_CLOSED", "httpStatus": 403, "body": nonce_r.text[:500]}
-    nonce_r.raise_for_status()
-    nonce_data = nonce_r.json()
-    nonce = nonce_data.get("nonce")
-    if not nonce:
-        return {"status": "ERROR", "reason": "nonce_missing"}
+    nonce, error = fresh_nonce(client)
+    if error:
+        return error
 
-    quantity = notional / price
     payload = {
         "propertyId": int(property_id),
-        "price": round(price, 8),
+        "price": round(price, 8) if order_type == "LIMIT" else 0,
         "quantity": round(quantity, 8),
         "side": side,
-        "type": "LIMIT",
+        "type": order_type,
         "timeInForce": "GTC",
         "deadline": 0,
         "nonce": nonce,
     }
     r = client.post(f"{BASE}/api/orders/", json=payload)
     if r.status_code == 403:
-        return {"status": "TRADING_GATE_CLOSED", "httpStatus": 403, "body": r.text[:500]}
+        return {"status": "TRADING_GATE_CLOSED", "httpStatus": 403, "body": r.text[:300]}
     r.raise_for_status()
     data = r.json()
-    if not data.get("success"):
+    if not isinstance(data, dict) or not data.get("success"):
         return {"status": "ORDER_REJECTED", "response": data}
     return {
         "status": "ORDER_ACCEPTED",
         "orderId": data.get("orderId"),
         "side": side,
-        "price": round(price, 8),
+        "type": order_type,
+        "price": round(price, 8) if order_type == "LIMIT" else 0,
         "quantity": round(quantity, 8),
-        "notional": round(price * quantity, 2),
     }
 
 
-def initial_side(now: datetime) -> str:
-    # Alternate the starting direction across five-minute GitHub sessions so restarts do not always bias BUY.
-    bucket = int(now.timestamp() // 300)
-    return "BUY" if bucket % 2 == 0 else "SELL"
+def passive_price(side: str, bid: float, ask: float) -> float:
+    mid = (bid + ask) / 2
+    improve = QUOTE_IMPROVEMENT_BPS / 10_000
+    if side == "BUY":
+        return min(bid * (1 + improve), mid * 0.999999, ask * 0.999999)
+    return max(ask * (1 - improve), mid * 1.000001, bid * 1.000001)
+
+
+def round_elapsed_ratio(now: datetime) -> float:
+    total = (END_UTC - START_UTC).total_seconds()
+    return max(0.0, min(1.0, (now - START_UTC).total_seconds() / total))
+
+
+def session_volume_target() -> float:
+    total_seconds = (END_UTC - START_UTC).total_seconds()
+    five_minute_windows = total_seconds / 300.0
+    return ROUND_VOLUME_TARGET / five_minute_windows
+
+
+def depth_capped_notional(side: str, bid: float, ask: float, bid_qty: float, ask_qty: float, desired: float) -> float:
+    # Market BUY consumes asks; market SELL consumes bids. Only use a fraction of visible top-level depth.
+    px = ask if side == "BUY" else bid
+    qty = ask_qty if side == "BUY" else bid_qty
+    if px <= 0:
+        return 0.0
+    if qty <= 0:
+        return min(desired, TAKER_NOTIONAL)
+    visible = px * qty
+    return max(0.0, min(desired, visible * DEPTH_FRACTION, MAX_TAKER_NOTIONAL))
+
+
+def maker_attempt(client: httpx.Client, property_id: int, side: str, bid: float, ask: float) -> tuple[bool, float]:
+    px = passive_price(side, bid, ask)
+    qty = MAKER_NOTIONAL / px
+    placed = place_order(client, property_id, side, qty, "LIMIT", px)
+    log({"event": "MAKER_ATTEMPT", **placed})
+    if placed.get("status") == "TRADING_GATE_CLOSED":
+        raise PermissionError("trading_gate_closed")
+    if placed.get("status") != "ORDER_ACCEPTED":
+        return False, 0.0
+
+    oid = placed.get("orderId")
+    time.sleep(MAKER_REST_SECONDS)
+    still_open = any(str(o.get("orderId")) == str(oid) for o in active_orders(client))
+    if still_open:
+        cancel_order(client, oid)
+        log({"event": "MAKER_STALE", "orderId": oid})
+        return False, 0.0
+
+    # Accepted and no longer active without our cancellation: treat as an inferred fill for pacing.
+    log({"event": "MAKER_INFERRED_FILL", "orderId": oid, "side": side, "estimatedVolume": MAKER_NOTIONAL})
+    return True, MAKER_NOTIONAL
+
+
+def taker_round_trip(
+    client: httpx.Client,
+    property_id: int,
+    bid: float,
+    ask: float,
+    bid_qty: float,
+    ask_qty: float,
+    desired_notional: float,
+) -> tuple[bool, float]:
+    # Always cancel resting account orders before crossing. This prevents self-interaction.
+    cancel_all_active(client)
+
+    buy_notional = depth_capped_notional("BUY", bid, ask, bid_qty, ask_qty, desired_notional)
+    sell_notional = depth_capped_notional("SELL", bid, ask, bid_qty, ask_qty, desired_notional)
+    notional = min(buy_notional, sell_notional, MAX_TAKER_NOTIONAL)
+    if notional < 50:
+        return False, 0.0
+
+    qty = notional / ask
+    buy = place_order(client, property_id, "BUY", qty, "MARKET")
+    log({"event": "TAKER_BUY", "notional": round(notional, 2), **buy})
+    if buy.get("status") == "TRADING_GATE_CLOSED":
+        raise PermissionError("trading_gate_closed")
+    if buy.get("status") != "ORDER_ACCEPTED":
+        return False, 0.0
+
+    time.sleep(0.75)
+
+    # Flatten the newly acquired exposure immediately. Use the same quantity, so a successful pair is near inventory-neutral.
+    sell = place_order(client, property_id, "SELL", qty, "MARKET")
+    log({"event": "TAKER_SELL", "notional": round(qty * bid, 2), **sell})
+    if sell.get("status") == "TRADING_GATE_CLOSED":
+        raise PermissionError("trading_gate_closed")
+    if sell.get("status") != "ORDER_ACCEPTED":
+        log({"status": "KILL_SWITCH", "reason": "round_trip_sell_failed_after_buy"})
+        raise RuntimeError("flatten_failed")
+
+    estimated = notional + qty * bid
+    return True, estimated
 
 
 def main() -> None:
@@ -194,38 +295,40 @@ def main() -> None:
         if now < START_UTC:
             log({"status": "WAITING_FOR_START", "now": now.isoformat(), "start": START_UTC.isoformat()})
             return
-
         if now >= END_UTC:
             cleaned = cancel_all_active(client)
-            log({"status": "ROUND_ENDED_CLEAN", "now": now.isoformat(), "end": END_UTC.isoformat(), "ordersCancelled": cleaned})
+            log({"status": "ROUND_ENDED_CLEAN", "ordersCancelled": cleaned})
             return
 
-        # Never inherit stale orders from a previous scheduled runner.
         cleaned = cancel_all_active(client)
-        log({"event": "SESSION_START", "market": MARKET, "staleOrdersCancelled": cleaned, "sessionBudgetSeconds": SESSION_BUDGET_SECONDS})
+        target = session_volume_target()
+        log({
+            "event": "SESSION_START",
+            "market": MARKET,
+            "roundTargetVolume": ROUND_VOLUME_TARGET,
+            "sessionTargetVolume": round(target, 2),
+            "staleOrdersCancelled": cleaned,
+            "mode": "MAKER_FIRST_HYBRID_VOLUME_PACE",
+        })
 
-        session_started = time.monotonic()
-        side = initial_side(now)
+        started = time.monotonic()
+        estimated_volume = 0.0
         errors = 0
         empty_books = 0
         cycle = 0
-        accepted = 0
-        inferred_fills = 0
-        stale_cancels = 0
-        quoted_notional = 0.0
+        next_maker_side = "BUY"
 
-        while time.monotonic() - session_started < SESSION_BUDGET_SECONDS:
+        while time.monotonic() - started < SESSION_BUDGET_SECONDS:
             cycle += 1
             current = datetime.now(timezone.utc)
             if current >= END_UTC:
                 cancel_all_active(client)
-                log({"status": "ROUND_ENDED_DURING_SESSION", "cycle": cycle})
+                log({"status": "ROUND_ENDED_DURING_SESSION"})
                 return
 
             try:
-                trade, property_id, bid, ask, bid_levels, ask_levels = read_market(client)
-                competition_flag = bool(trade.get("competitionModeActive", False)) if isinstance(trade, dict) else False
-                liquidity = trade.get("liquidity") if isinstance(trade, dict) and isinstance(trade.get("liquidity"), dict) else {}
+                trade, property_id, bid, ask, bid_qty, ask_qty, bid_levels, ask_levels = read_market(client)
+                competition_active = bool(trade.get("competitionModeActive", False)) if isinstance(trade, dict) else False
 
                 if property_id is None or bid <= 0 or ask <= bid:
                     empty_books += 1
@@ -233,18 +336,16 @@ def main() -> None:
                         "cycle": cycle,
                         "status": "SKIP",
                         "reason": "no_safe_two_sided_book",
-                        "propertyId": property_id,
                         "bestBid": bid,
                         "bestAsk": ask,
                         "bidLevels": bid_levels,
                         "askLevels": ask_levels,
-                        "competitionModeActive": competition_flag,
-                        "liquidity": liquidity,
+                        "competitionModeActive": competition_active,
                         "emptyBookStreak": empty_books,
                     })
                     if empty_books >= MAX_EMPTY_BOOKS:
                         cancel_all_active(client)
-                        log({"status": "SESSION_PAUSED", "reason": "market_book_unavailable", "emptyBookStreak": empty_books})
+                        log({"status": "SESSION_PAUSED", "reason": "book_unavailable"})
                         return
                     time.sleep(COOLDOWN_SECONDS)
                     continue
@@ -252,76 +353,58 @@ def main() -> None:
                 empty_books = 0
                 mid = (bid + ask) / 2
                 spread_pct = (ask - bid) / mid * 100
-                if spread_pct > MAX_SPREAD_PCT:
-                    log({"cycle": cycle, "status": "SKIP", "reason": "spread_too_wide", "spreadPct": round(spread_pct, 6)})
-                    time.sleep(COOLDOWN_SECONDS)
-                    continue
+                elapsed_session = time.monotonic() - started
+                session_ratio = min(1.0, elapsed_session / SESSION_BUDGET_SECONDS)
+                expected_by_now = target * session_ratio
+                pace_deficit = max(0.0, expected_by_now - estimated_volume)
 
-                # Hard invariant: one account order at a time. Never quote both sides simultaneously.
-                existing = active_orders(client)
-                if existing:
-                    for order in existing:
-                        oid = order.get("orderId")
-                        if oid is not None:
-                            cancel_order(client, oid)
-                            stale_cancels += 1
-                    time.sleep(0.75)
-
-                elapsed_ratio = max(0.0, min(1.0, (current - START_UTC).total_seconds() / (END_UTC - START_UTC).total_seconds()))
-                notional = adaptive_notional(spread_pct, elapsed_ratio)
-                order_price = passive_price(side, bid, ask)
-                if not (bid <= order_price < ask) and side == "BUY":
-                    order_price = bid
-                if not (bid < order_price <= ask) and side == "SELL":
-                    order_price = ask
-
-                placed = place_passive_order(client, property_id, side, order_price, notional)
                 log({
                     "cycle": cycle,
-                    "competitionModeActive": competition_flag,
-                    "spreadPct": round(spread_pct, 6),
-                    "elapsedRoundPct": round(elapsed_ratio * 100, 2),
-                    **placed,
+                    "bestBid": bid,
+                    "bestAsk": ask,
+                    "spreadPct": round(spread_pct, 5),
+                    "estimatedSessionVolume": round(estimated_volume, 2),
+                    "expectedByNow": round(expected_by_now, 2),
+                    "paceDeficit": round(pace_deficit, 2),
+                    "roundElapsedPct": round(round_elapsed_ratio(current) * 100, 2),
                 })
 
-                if placed.get("status") == "TRADING_GATE_CLOSED":
-                    cancel_all_active(client)
-                    log({"status": "SESSION_STOPPED", "reason": "trading_gate_closed"})
-                    return
+                # First preference: fee-free maker volume while the book is tradeable.
+                maker_filled = False
+                if spread_pct <= MAX_MAKER_SPREAD_PCT and estimated_volume < target:
+                    maker_filled, maker_vol = maker_attempt(client, property_id, next_maker_side, bid, ask)
+                    if maker_filled:
+                        estimated_volume += maker_vol
+                        next_maker_side = "SELL" if next_maker_side == "BUY" else "BUY"
 
-                if placed.get("status") != "ORDER_ACCEPTED":
-                    errors += 1
-                    if errors >= MAX_ERRORS:
-                        cancel_all_active(client)
-                        log({"status": "KILL_SWITCH", "reason": "order_errors", "errors": errors})
-                        return
-                    time.sleep(COOLDOWN_SECONDS)
-                    continue
+                # If maker did not fill and the session is behind pace, cross only a very tight spread.
+                if (
+                    not maker_filled
+                    and estimated_volume < target
+                    and spread_pct <= MAX_TAKER_SPREAD_PCT
+                    and pace_deficit >= TAKER_NOTIONAL
+                ):
+                    desired = min(MAX_TAKER_NOTIONAL, max(TAKER_NOTIONAL, pace_deficit / 2))
+                    ok, taker_vol = taker_round_trip(
+                        client, property_id, bid, ask, bid_qty, ask_qty, desired
+                    )
+                    if ok:
+                        estimated_volume += taker_vol
+
+                if estimated_volume >= target:
+                    log({"status": "SESSION_TARGET_REACHED", "estimatedSessionVolume": round(estimated_volume, 2), "target": round(target, 2)})
+                    break
 
                 errors = 0
-                accepted += 1
-                quoted_notional += float(placed.get("notional", 0) or 0)
-                order_id = placed.get("orderId")
-                time.sleep(REST_SECONDS)
-
-                still_active = any(str(o.get("orderId")) == str(order_id) for o in active_orders(client))
-                if still_active:
-                    cancel_order(client, order_id)
-                    stale_cancels += 1
-                    exit_state = "CANCELLED_STALE"
-                    # No evidence of a fill: keep the same direction next cycle.
-                else:
-                    inferred_fills += 1
-                    exit_state = "LEFT_ACTIVE_BOOK"
-                    # Likely filled or otherwise completed: reverse direction to reduce inventory drift.
-                    side = "SELL" if side == "BUY" else "BUY"
-
-                log({"cycle": cycle, "event": "ORDER_EXIT", "orderId": order_id, "state": exit_state, "nextSide": side})
                 time.sleep(COOLDOWN_SECONDS)
 
+            except PermissionError:
+                cancel_all_active(client)
+                log({"status": "SESSION_STOPPED", "reason": "competition_not_admitted_or_trading_halted"})
+                return
             except httpx.HTTPStatusError as exc:
                 errors += 1
-                log({"cycle": cycle, "status": "HTTP_ERROR", "code": exc.response.status_code, "body": exc.response.text[:500], "errors": errors})
+                log({"cycle": cycle, "status": "HTTP_ERROR", "code": exc.response.status_code, "body": exc.response.text[:300]})
                 if errors >= MAX_ERRORS:
                     cancel_all_active(client)
                     log({"status": "KILL_SWITCH", "reason": "http_errors", "errors": errors})
@@ -329,26 +412,22 @@ def main() -> None:
                 time.sleep(COOLDOWN_SECONDS)
             except Exception as exc:
                 errors += 1
-                log({"cycle": cycle, "status": "ERROR", "error": str(exc), "errors": errors})
-                if errors >= MAX_ERRORS:
+                log({"cycle": cycle, "status": "ERROR", "error": str(exc)})
+                if errors >= MAX_ERRORS or str(exc) == "flatten_failed":
                     cancel_all_active(client)
-                    log({"status": "KILL_SWITCH", "reason": "runtime_errors", "errors": errors})
+                    log({"status": "KILL_SWITCH", "reason": "runtime_or_flatten_error", "errors": errors})
                     return
                 time.sleep(COOLDOWN_SECONDS)
 
-        cleaned = cancel_all_active(client)
+        cancel_all_active(client)
         log({
             "status": "ENGINE_SESSION_COMPLETE",
             "market": MARKET,
-            "cycles": cycle,
-            "ordersAccepted": accepted,
-            "ordersLeftActiveBookBeforeCancel": inferred_fills,
-            "staleCancels": stale_cancels,
-            "quotedNotional": round(quoted_notional, 2),
-            "baseNotional": BASE_NOTIONAL,
-            "maxNotionalPerOrder": MAX_NOTIONAL,
-            "finalCleanupCancelled": cleaned,
-            "safety": "one passive order only; no self-crossing; adaptive sizing; stale cleanup; error and empty-book kill switches",
+            "estimatedSessionVolume": round(estimated_volume, 2),
+            "sessionTargetVolume": round(target, 2),
+            "targetHit": estimated_volume >= target,
+            "roundTargetVolume": ROUND_VOLUME_TARGET,
+            "safety": "maker-first; taker only when behind pace and spread is tight; market orders paired BUY->SELL; no simultaneous opposing account orders; stale-order cleanup; kill-switch",
         })
 
 
@@ -356,5 +435,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print(json.dumps({"status": "FATAL", "error": str(exc)}, indent=2), flush=True)
+        log({"status": "FATAL", "error": str(exc)})
         sys.exit(1)
