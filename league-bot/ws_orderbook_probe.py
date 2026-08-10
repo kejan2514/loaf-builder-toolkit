@@ -10,9 +10,9 @@ import websockets
 
 BASE = os.getenv("LOAF_API_BASE", "https://api.loafmarkets.com").rstrip("/")
 TOKEN = os.getenv("LOAF_API_KEY", "")
-MARKET = os.getenv("LOAF_TOKEN_NAME", "terafab")
+MARKET = os.getenv("LOAF_TOKEN_NAME", "terafab").lower()
 WS_URL = os.getenv("LOAF_WS_URL", "")
-TIMEOUT = float(os.getenv("LOAF_WS_PROBE_TIMEOUT", "8"))
+TIMEOUT = float(os.getenv("LOAF_WS_PROBE_TIMEOUT", "12"))
 
 
 def resolve_ws_url() -> str:
@@ -84,54 +84,56 @@ async def probe() -> None:
         "tradeTopKeys": list(trade.keys())[:20] if isinstance(trade, dict) else [],
     }))
 
-    if property_id is None:
-        raise SystemExit("Could not resolve propertyId from Loaf REST metadata. No trading action attempted.")
-
     ws_url = resolve_ws_url()
-    channel = f"orderbook:{property_id}"
+    # Current Loaf WS channels are keyed by lowercase tokenName, not propertyId.
+    channel = f"orderbook:{MARKET}"
     print(json.dumps({"wsUrl": ws_url, "channel": channel, "mode": "READ_ONLY_PROBE"}))
 
-    # Public orderbook does not require a private channel. Try the two common
-    # subscription envelopes used by Loaf-compatible WS gateways and stop as
-    # soon as an orderbook_update arrives. No nonce/order/cancel endpoints exist here.
-    subscribe_frames = [
-        {"type": "subscribe", "channel": channel},
-        {"action": "subscribe", "channel": channel},
-        {"type": "subscribe", "channels": [channel]},
-    ]
-
     async with websockets.connect(ws_url, ping_interval=20, close_timeout=3) as ws:
-        for frame in subscribe_frames:
-            print("SUBSCRIBE", json.dumps(frame))
-            await ws.send(json.dumps(frame))
-            deadline = asyncio.get_running_loop().time() + TIMEOUT
-            while asyncio.get_running_loop().time() < deadline:
-                try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=2)
-                except asyncio.TimeoutError:
-                    break
-                print("WS_MESSAGE", raw[:1000] if isinstance(raw, str) else str(raw)[:1000])
-                try:
-                    msg = json.loads(raw)
-                except Exception:
-                    continue
-                if isinstance(msg, dict) and msg.get("type") == "orderbook_update":
-                    bid, ask = best_prices(msg)
-                    print(json.dumps({
-                        "status": "WEBSOCKET_ORDERBOOK_OK",
-                        "propertyId": property_id,
-                        "bestBid": bid,
-                        "bestAsk": ask,
-                        "bidLevels": len(msg.get("bids") or []),
-                        "askLevels": len(msg.get("asks") or []),
-                    }, indent=2))
-                    print("SAFE WS PROBE COMPLETE: no nonce requested, no order placed, no order cancelled.")
-                    return
+        # The gateway expects channels to be an array of strings.
+        frame = {"type": "subscribe", "channels": [channel]}
+        print("SUBSCRIBE", json.dumps(frame))
+        await ws.send(json.dumps(frame))
+
+        deadline = asyncio.get_running_loop().time() + TIMEOUT
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=3)
+            except asyncio.TimeoutError:
+                continue
+            print("WS_MESSAGE", raw[:1500] if isinstance(raw, str) else str(raw)[:1500])
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+
+            if isinstance(msg, dict) and msg.get("type") == "orderbook_update":
+                bid, ask = best_prices(msg)
+                print(json.dumps({
+                    "status": "WEBSOCKET_ORDERBOOK_OK",
+                    "tokenName": MARKET,
+                    "propertyId": msg.get("propertyId", property_id),
+                    "bestBid": bid,
+                    "bestAsk": ask,
+                    "bidLevels": len(msg.get("bids") or []),
+                    "askLevels": len(msg.get("asks") or []),
+                }, indent=2))
+                print("SAFE WS PROBE COMPLETE: no nonce requested, no order placed, no order cancelled.")
+                return
+
+            if isinstance(msg, dict) and msg.get("type") == "error":
+                print(json.dumps({
+                    "status": "WS_SUBSCRIPTION_ERROR",
+                    "channel": channel,
+                    "serverError": msg,
+                }, indent=2))
 
     print(json.dumps({
         "status": "NO_ORDERBOOK_UPDATE",
+        "tokenName": MARKET,
         "propertyId": property_id,
-        "note": "WebSocket connected but no orderbook_update was observed with the tested public subscription envelopes."
+        "channel": channel,
+        "note": "Connected and subscribed using tokenName, but no orderbook_update arrived within the probe timeout."
     }, indent=2))
 
 
