@@ -1,0 +1,35 @@
+name: Loaf League Bot - Adaptive Calibration
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'league-bot/calibrate.py'
+      - '.github/workflows/loaf-league-calibration.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  calibrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependency
+        run: pip install 'httpx>=0.27,<1'
+      - name: Calibrate strategy from live Loaf market data
+        env:
+          LOAF_API_KEY: ${{ secrets.LOAF_API_TOKEN }}
+          LOAF_API_BASE: https://api.loafmarkets.com
+          LOAF_TOKEN_NAME: terafab
+          LOAF_CALIBRATION_CYCLES: '12'
+          LOAF_CALIBRATION_INTERVAL_SECONDS: '10'
+          LOAF_ORDER_SIZE: '2'
+          LOAF_MAX_NOTIONAL_PER_ORDER: '1500'
+          LOAF_MAX_SPREAD_PCT: '1.5'
+        run: python league-bot/calibrate.py
