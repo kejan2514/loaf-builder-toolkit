@@ -4,11 +4,17 @@ on:
   workflow_dispatch:
   schedule:
     # Round 1 starts 2026-08-13 02:00 UTC (05:00 Turkey time).
-    # Probe every 5 minutes during the launch window. The script itself is read-only.
+    # Warm-up checks every 15 minutes during the evening before launch.
+    - cron: '*/15 18-23 12 8 *'
+    # Closer checks every 5 minutes from 01:00-07:59 UTC on launch day.
     - cron: '*/5 1-7 13 8 *'
 
 permissions:
   contents: read
+
+concurrency:
+  group: loaf-competition-ready
+  cancel-in-progress: true
 
 jobs:
   competition-ready:
