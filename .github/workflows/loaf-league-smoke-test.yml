@@ -1,0 +1,29 @@
+name: Loaf League Bot - Read Only Smoke Test
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'league-bot/smoke_test.py'
+      - '.github/workflows/loaf-league-smoke-test.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependency
+        run: pip install 'httpx>=0.27,<1'
+      - name: Run read-only Loaf smoke test
+        env:
+          LOAF_API_KEY: ${{ secrets.LOAF_API_TOKEN }}
+          LOAF_API_BASE: https://api.loafmarkets.com
+          LOAF_TOKEN_NAME: terafab
+        run: python league-bot/smoke_test.py
