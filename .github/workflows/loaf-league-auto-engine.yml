@@ -4,16 +4,16 @@ on:
   workflow_dispatch:
   schedule:
     # Round 1: 2026-08-13 02:00 UTC through 2026-08-18 02:00 UTC.
-    # Run a guarded ~4 minute session every 5 minutes during the round window.
+    # Guarded sessions run every 5 minutes; the final 02:00-02:10 window performs cleanup only.
     - cron: '*/5 * 13-17 8 *'
-    - cron: '*/5 0-1 18 8 *'
+    - cron: '*/5 0-2 18 8 *'
 
 permissions:
   contents: read
 
 concurrency:
   group: loaf-league-auto-engine
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   auto-engine:
@@ -26,16 +26,18 @@ jobs:
           python-version: '3.12'
       - name: Install dependency
         run: pip install 'httpx>=0.27,<1'
-      - name: Run guarded autonomous competition engine
+      - name: Run hardened autonomous competition engine
         env:
           LOAF_API_KEY: ${{ secrets.LOAF_API_TOKEN }}
           LOAF_API_BASE: https://api.loafmarkets.com
           LOAF_TOKEN_NAME: terafab
-          LOAF_ENGINE_MAX_NOTIONAL: '250'
-          LOAF_ENGINE_MAX_SPREAD_PCT: '2.0'
-          LOAF_ENGINE_CYCLES: '15'
-          LOAF_ENGINE_REST_SECONDS: '10'
-          LOAF_ENGINE_COOLDOWN_SECONDS: '6'
+          LOAF_ENGINE_BASE_NOTIONAL: '200'
+          LOAF_ENGINE_MAX_NOTIONAL: '500'
+          LOAF_ENGINE_MAX_SPREAD_PCT: '1.5'
+          LOAF_ENGINE_QUOTE_IMPROVEMENT_BPS: '1'
+          LOAF_ENGINE_REST_SECONDS: '8'
+          LOAF_ENGINE_COOLDOWN_SECONDS: '3'
+          LOAF_ENGINE_SESSION_BUDGET_SECONDS: '210'
           LOAF_ENGINE_MAX_ERRORS: '3'
-          LOAF_ENGINE_START_SIDE: 'BUY'
+          LOAF_ENGINE_MAX_EMPTY_BOOKS: '12'
         run: python league-bot/competition_engine.py
