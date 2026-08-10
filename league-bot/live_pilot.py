@@ -82,31 +82,42 @@ def main() -> None:
             "market": MARKET,
             "propertyId": property_id,
             "competitionModeActive": competition_active,
+            "competitionFlagRole": "informational_only",
             "liquidity": liquidity,
             "bestBid": bid,
             "bestAsk": ask,
             "mode": "GUARDED_TINY_LIVE_PILOT"
         }, indent=2))
 
-        if not competition_active:
-            print(json.dumps({"status": "SKIP", "reason": "Competition mode is not active"}, indent=2))
-            return
+        # Do not use competitionModeActive as the trading-authorisation gate.
+        # Loaf's documented gate is account trading enablement (e.g. competition
+        # admission during an active round). The Orders API itself is authoritative
+        # and will return 403 when the account is not admitted/enabled.
         if bid <= 0 or ask <= bid:
-            print(json.dumps({"status": "SKIP", "reason": "No safe two-sided book"}, indent=2))
+            print(json.dumps({
+                "status": "SKIP",
+                "reason": "No safe two-sided book",
+                "note": "competitionModeActive is informational; no order attempted without a valid market book."
+            }, indent=2))
             return
 
         mid = (bid + ask) / 2
-        # One passive order only. Never cross the spread and never place opposing self-orders.
-        if SIDE == "BUY":
-            order_price = bid
-        else:
-            order_price = ask
-
+        order_price = bid if SIDE == "BUY" else ask
         quantity = MAX_NOTIONAL / order_price
         if quantity <= 0:
             raise SystemExit("Invalid pilot quantity")
 
+        # Probe the actual documented trading gate by requesting a fresh nonce.
+        # A 403 means trading is not enabled/admitted for this account.
         nonce_r = client.post(f"{BASE}/api/orders/nonce")
+        if nonce_r.status_code == 403:
+            print(json.dumps({
+                "status": "TRADING_GATE_CLOSED",
+                "httpStatus": 403,
+                "reason": "Loaf account is not currently trading-enabled/admitted",
+                "response": nonce_r.text[:500]
+            }, indent=2))
+            return
         nonce_r.raise_for_status()
         nonce_data = nonce_r.json()
         nonce = nonce_data.get("nonce")
@@ -131,6 +142,14 @@ def main() -> None:
         }, indent=2))
 
         placed_r = client.post(f"{BASE}/api/orders/", json=payload)
+        if placed_r.status_code == 403:
+            print(json.dumps({
+                "status": "TRADING_GATE_CLOSED",
+                "httpStatus": 403,
+                "reason": "Order API denied trading access",
+                "response": placed_r.text[:500]
+            }, indent=2))
+            return
         placed_r.raise_for_status()
         placed = placed_r.json()
         if not placed.get("success"):
