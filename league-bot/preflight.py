@@ -22,25 +22,74 @@ MAX_MID_RANGE_PCT = float(os.getenv("LOAF_PREFLIGHT_MAX_MID_RANGE_PCT", "1.25"))
 MIN_READY_RATE = float(os.getenv("LOAF_PREFLIGHT_MIN_READY_RATE", "75"))
 
 
-def levels(snapshot: dict, name: str) -> list:
-    book = snapshot.get("orderBook") or snapshot.get("orderbook") or snapshot
-    return (book.get(name, []) or []) if isinstance(book, dict) else []
-
-
 def px(level) -> float:
     if isinstance(level, dict):
-        return float(level.get("price", 0) or 0)
+        for key in ("price", "px", "p"):
+            if key in level:
+                try:
+                    return float(level.get(key) or 0)
+                except (TypeError, ValueError):
+                    return 0.0
     if isinstance(level, (list, tuple)) and level:
-        return float(level[0])
+        try:
+            return float(level[0])
+        except (TypeError, ValueError):
+            return 0.0
     return 0.0
 
 
-def read_book(client: httpx.Client) -> tuple[float, float]:
+def find_book(node):
+    """Recursively locate the first plausible bids/asks container in Loaf's trade payload."""
+    if isinstance(node, dict):
+        lower = {str(k).lower(): k for k in node.keys()}
+        bid_key = next((lower[k] for k in ("bids", "buyorders", "buy_orders") if k in lower), None)
+        ask_key = next((lower[k] for k in ("asks", "sellorders", "sell_orders") if k in lower), None)
+        if bid_key is not None or ask_key is not None:
+            return node.get(bid_key, []) if bid_key is not None else [], node.get(ask_key, []) if ask_key is not None else []
+        for value in node.values():
+            found = find_book(value)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for value in node:
+            found = find_book(value)
+            if found is not None:
+                return found
+    return None
+
+
+def best_prices(snapshot: dict) -> tuple[float, float]:
+    found = find_book(snapshot)
+    if found is None:
+        return 0.0, 0.0
+    bids, asks = found
+    bid_prices = [px(x) for x in bids] if isinstance(bids, list) else []
+    ask_prices = [px(x) for x in asks] if isinstance(asks, list) else []
+    bid_prices = [p for p in bid_prices if p > 0]
+    ask_prices = [p for p in ask_prices if p > 0]
+    return (max(bid_prices) if bid_prices else 0.0, min(ask_prices) if ask_prices else 0.0)
+
+
+def snapshot_shape(node, depth=0, max_depth=3):
+    if depth > max_depth:
+        return "..."
+    if isinstance(node, dict):
+        return {str(k): snapshot_shape(v, depth + 1, max_depth) for k, v in list(node.items())[:20]}
+    if isinstance(node, list):
+        return [snapshot_shape(node[0], depth + 1, max_depth)] if node else []
+    return type(node).__name__
+
+
+def read_book(client: httpx.Client, debug=False) -> tuple[float, float]:
     r = client.get(f"{BASE}/api/trade/{MARKET}")
     r.raise_for_status()
     snap = r.json()
-    bids, asks = levels(snap, "bids"), levels(snap, "asks")
-    return (px(bids[0]) if bids else 0.0, px(asks[0]) if asks else 0.0)
+    bid, ask = best_prices(snap)
+    if debug:
+        print("TRADE SNAPSHOT SHAPE")
+        print(json.dumps(snapshot_shape(snap), indent=2))
+        print(json.dumps({"parsedBestBid": bid, "parsedBestAsk": ask}))
+    return bid, ask
 
 
 def main() -> None:
@@ -52,13 +101,14 @@ def main() -> None:
         h = client.get(f"{BASE}/api/info/{MARKET}/header")
         h.raise_for_status()
         property_id = h.json().get("propertyId")
+        print(json.dumps({"market": MARKET, "propertyId": property_id, "apiBase": BASE}))
 
         mids: list[float] = []
         spreads: list[float] = []
         valid = 0
         print("=== CALIBRATION PHASE ===")
         for i in range(CAL_CYCLES):
-            bid, ask = read_book(client)
+            bid, ask = read_book(client, debug=(i == 0))
             row = {"phase": "calibration", "cycle": i + 1, "bestBid": bid, "bestAsk": ask}
             if bid > 0 and ask > bid:
                 mid = (bid + ask) / 2
@@ -73,7 +123,11 @@ def main() -> None:
                 time.sleep(INTERVAL)
 
         if not mids:
-            print(json.dumps({"status": "NOT_READY", "reason": "No safe two-sided quotes during calibration"}, indent=2))
+            print(json.dumps({
+                "status": "NOT_READY",
+                "reason": "REST snapshot still has no safe two-sided quotes",
+                "nextAction": "Use the official Loaf WebSocket orderbook feed (orderbook:{propertyId})"
+            }, indent=2))
             return
 
         avg_mid = statistics.mean(mids)
@@ -157,7 +211,7 @@ def main() -> None:
             "shadowSimulatedFills": simulated_fills,
             "projectedQuotedNotional": round(projected_notional, 2),
             "liveTradingEnabled": False,
-            "note": "Preflight never requests a nonce or places/cancels orders. A READY result only supports a small supervised pilot, not unattended trading.",
+            "note": "Preflight never requests a nonce or places/cancels orders.",
         }
         print("=== PREFLIGHT REPORT ===")
         print(json.dumps(report, indent=2))
