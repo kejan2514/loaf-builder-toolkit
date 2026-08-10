@@ -1,0 +1,31 @@
+name: Loaf League Bot - WebSocket Orderbook Probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'league-bot/ws_orderbook_probe.py'
+      - '.github/workflows/loaf-league-ws-probe.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  ws-probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: pip install 'httpx>=0.27,<1' 'websockets>=13,<16'
+      - name: Probe official Loaf WebSocket orderbook feed
+        env:
+          LOAF_API_KEY: ${{ secrets.LOAF_API_TOKEN }}
+          LOAF_API_BASE: https://api.loafmarkets.com
+          LOAF_TOKEN_NAME: terafab
+          LOAF_WS_PROBE_TIMEOUT: '8'
+        run: python league-bot/ws_orderbook_probe.py
