@@ -1,0 +1,37 @@
+name: Loaf League Bot - Shadow Execution
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'league-bot/shadow_sim.py'
+      - '.github/workflows/loaf-league-shadow.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  shadow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependency
+        run: pip install 'httpx>=0.27,<1'
+      - name: Run conservative shadow execution model
+        env:
+          LOAF_API_KEY: ${{ secrets.LOAF_API_TOKEN }}
+          LOAF_API_BASE: https://api.loafmarkets.com
+          LOAF_TOKEN_NAME: terafab
+          LOAF_SHADOW_CYCLES: '8'
+          LOAF_SHADOW_INTERVAL_SECONDS: '15'
+          LOAF_ORDER_SIZE: '2'
+          LOAF_MAX_INVENTORY: '40'
+          LOAF_MAX_NOTIONAL_PER_ORDER: '1500'
+          LOAF_MAX_SPREAD_PCT: '1.5'
+          LOAF_QUOTE_OFFSET_BPS: '2'
+        run: python league-bot/shadow_sim.py
