@@ -1,0 +1,38 @@
+name: Loaf League Bot - Adaptive Preflight
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'league-bot/preflight.py'
+      - '.github/workflows/loaf-league-preflight.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependency
+        run: pip install 'httpx>=0.27,<1'
+      - name: Run adaptive calibration and shadow preflight
+        env:
+          LOAF_API_KEY: ${{ secrets.LOAF_API_TOKEN }}
+          LOAF_API_BASE: https://api.loafmarkets.com
+          LOAF_TOKEN_NAME: terafab
+          LOAF_ORDER_SIZE: '2'
+          LOAF_MAX_NOTIONAL_PER_ORDER: '1500'
+          LOAF_MAX_SPREAD_PCT: '1.5'
+          LOAF_PREFLIGHT_CAL_CYCLES: '8'
+          LOAF_PREFLIGHT_SHADOW_CYCLES: '10'
+          LOAF_PREFLIGHT_INTERVAL_SECONDS: '8'
+          LOAF_PREFLIGHT_MIN_READY_RATE: '75'
+          LOAF_PREFLIGHT_MAX_MID_RANGE_PCT: '1.25'
+        run: python league-bot/preflight.py
