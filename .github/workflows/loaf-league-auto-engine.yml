@@ -3,8 +3,6 @@ name: Loaf League Bot - Auto Competition Engine
 on:
   workflow_dispatch:
   schedule:
-    # Round 1: 2026-08-13 02:00 UTC through 2026-08-18 02:00 UTC.
-    # Run a guarded session every 5 minutes; the final 02:00 hour performs cleanup only.
     - cron: '*/5 * 13-17 8 *'
     - cron: '*/5 0-2 18 8 *'
 
@@ -29,17 +27,14 @@ jobs:
       - name: Run Round 1 maker-first hybrid volume engine
         env:
           LOAF_API_KEY: ${{ secrets.LOAF_API_TOKEN }}
-          LOAF_API_BASE: https://api.loafmarkets.com
-          LOAF_TOKEN_NAME: terafab
-          # Published 5x multiplier begins at $30M traded volume. Aim above it for buffer.
+          LOAF_API_BASE_URL: https://api.loafmarkets.com/api
+          LOAF_TARGET_TOKEN: terafab
           LOAF_ENGINE_ROUND_VOLUME_TARGET: '35000000'
           LOAF_ENGINE_SESSION_BUDGET_SECONDS: '210'
-          # Maker-first because Round 1 publishes maker 0% / taker 0.1% fees.
           LOAF_ENGINE_MAKER_NOTIONAL: '3000'
           LOAF_ENGINE_TAKER_NOTIONAL: '1250'
           LOAF_ENGINE_MAX_TAKER_NOTIONAL: '2000'
           LOAF_ENGINE_MAX_MAKER_SPREAD_PCT: '1.0'
-          # Only use taker round-trips when spread is extremely tight to protect the $100k mock capital.
           LOAF_ENGINE_MAX_TAKER_SPREAD_PCT: '0.10'
           LOAF_ENGINE_QUOTE_IMPROVEMENT_BPS: '1'
           LOAF_ENGINE_MAKER_REST_SECONDS: '5'
