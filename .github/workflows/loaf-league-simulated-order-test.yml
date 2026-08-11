@@ -1,0 +1,41 @@
+name: Loaf League Bot - Simulated Order Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      side:
+        description: Simulated side
+        required: true
+        default: BUY
+        type: choice
+        options:
+          - BUY
+          - SELL
+      notional:
+        description: Simulated notional USD
+        required: true
+        default: '250'
+
+permissions:
+  contents: read
+
+jobs:
+  simulated-order-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependency
+        run: pip install 'httpx>=0.27,<1'
+      - name: Build zero-write simulated Loaf order
+        env:
+          LOAF_API_KEY: ${{ secrets.LOAF_API_TOKEN }}
+          LOAF_API_BASE: https://api.loafmarkets.com
+          LOAF_TOKEN_NAME: terafab
+          LOAF_SIM_SIDE: ${{ inputs.side }}
+          LOAF_SIM_NOTIONAL: ${{ inputs.notional }}
+          LOAF_SIM_SYNTHETIC_IF_EMPTY: 'true'
+        run: python league-bot/simulated_order_test.py
