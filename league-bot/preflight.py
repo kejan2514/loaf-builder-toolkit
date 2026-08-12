@@ -39,7 +39,6 @@ def px(level) -> float:
 
 
 def find_book(node):
-    """Recursively locate the first plausible bids/asks container in Loaf's trade payload."""
     if isinstance(node, dict):
         lower = {str(k).lower(): k for k in node.keys()}
         bid_key = next((lower[k] for k in ("bids", "buyorders", "buy_orders") if k in lower), None)
@@ -100,7 +99,16 @@ def main() -> None:
     with httpx.Client(timeout=15, headers=headers) as client:
         h = client.get(f"{BASE}/api/info/{MARKET}/header")
         h.raise_for_status()
-        property_id = h.json().get("propertyId")
+        header = h.json()
+        property_id = header.get("propertyId") if isinstance(header, dict) else None
+        if property_id is None:
+            print(json.dumps({
+                "status": "NOT_READY",
+                "reason": "propertyId_missing_from_market_header",
+                "market": MARKET,
+                "apiBase": BASE,
+            }, indent=2))
+            sys.exit(1)
         print(json.dumps({"market": MARKET, "propertyId": property_id, "apiBase": BASE}))
 
         mids: list[float] = []
