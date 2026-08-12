@@ -38,21 +38,38 @@ jobs:
           set -euo pipefail
           mkdir -p public
 
+          is_valid_snapshot() {
+            node -e "const fs=require('fs'); const p=process.argv[1]; const raw=fs.readFileSync(p,'utf8').trim(); if(!raw) process.exit(1); const d=JSON.parse(raw); if(!Array.isArray(d.properties)) process.exit(1); console.log('Validated markets:', d.properties.length)" "$1"
+          }
+
+          fresh_file="$(mktemp)"
+          fallback_file="$(mktemp)"
+          trap 'rm -f "$fresh_file" "$fallback_file"' EXIT
+
           if curl --fail --silent --show-error \
             --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 30 \
             --header 'Accept: application/json' \
             'https://api.loafmarkets.com/api/trade' \
-            --output public/markets.json; then
-            echo 'Fetched fresh Loaf market snapshot.'
+            --output "$fresh_file" \
+            && is_valid_snapshot "$fresh_file"; then
+            mv "$fresh_file" public/markets.json
+            echo 'Fetched and validated fresh Loaf market snapshot.'
           else
-            echo 'Loaf API unavailable; attempting to reuse the last deployed snapshot.'
-            curl --fail --silent --show-error \
+            echo 'Fresh Loaf API response was unavailable or invalid; attempting last deployed snapshot.'
+            if curl --fail --silent --show-error \
               --connect-timeout 10 --max-time 30 \
               'https://kejan2514.github.io/loaf-builder-toolkit/markets.json' \
-              --output public/markets.json
+              --output "$fallback_file" \
+              && is_valid_snapshot "$fallback_file"; then
+              mv "$fallback_file" public/markets.json
+              echo 'Reused last valid deployed snapshot.'
+            else
+              echo 'No valid remote snapshot available; using an empty safe snapshot so Pages can still deploy.'
+              printf '%s\n' '{"properties":[]}' > public/markets.json
+            fi
           fi
 
-          node -e "const fs=require('fs'); const d=JSON.parse(fs.readFileSync('public/markets.json','utf8')); if(!Array.isArray(d.properties)) throw new Error('Unexpected Loaf API response'); console.log('Synced markets:', d.properties.length)"
+          is_valid_snapshot public/markets.json
 
       - name: Build
         run: npm run build
