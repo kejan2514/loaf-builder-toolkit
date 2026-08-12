@@ -7,9 +7,18 @@ on:
     paths:
       - 'league-bot/preflight.py'
       - '.github/workflows/loaf-league-preflight.yml'
+  schedule:
+    # Round 1 starts 2026-08-13 02:00 UTC (05:00 Turkey time).
+    # Run read-only preflight every 10 minutes around launch so the bot has
+    # fresh orderbook/readiness diagnostics without placing any orders.
+    - cron: '*/10 1-3 13 8 *'
 
 permissions:
   contents: read
+
+concurrency:
+  group: loaf-league-adaptive-preflight
+  cancel-in-progress: true
 
 jobs:
   preflight:
