@@ -28,7 +28,10 @@ def fnum(v,d=0.):
     except:return d
 
 def read_market(c):
-    h=c.get(f'{BASE}/info/{MARKET}/header'); h.raise_for_status()
+    h=c.get(f'{BASE}/info/{MARKET}/header'); h.raise_for_status(); header=h.json()
+    property_id=header.get('propertyId') if isinstance(header,dict) else None
+    if property_id is None:
+        raise RuntimeError('propertyId_missing_from_info_header')
     t=c.get(f'{BASE}/trade/{MARKET}'); t.raise_for_status(); trade=t.json(); book=trade.get('orderBook') or {}
     def pq(x):
         if isinstance(x,dict): return fnum(x.get('price')),fnum(x.get('quantity'))
@@ -36,7 +39,7 @@ def read_market(c):
     bids=[pq(x) for x in book.get('bids') or []]; asks=[pq(x) for x in book.get('asks') or []]
     bids=[x for x in bids if x[0]>0]; asks=[x for x in asks if x[0]>0]
     bid,bq=max(bids,key=lambda x:x[0]) if bids else (0,0); ask,aq=min(asks,key=lambda x:x[0]) if asks else (0,0)
-    return trade,bid,ask,bq,aq,len(bids),len(asks)
+    return int(property_id),trade,bid,ask,bq,aq,len(bids),len(asks)
 
 def active_orders(c):
     r=c.get(f'{BASE}/history/orders/active'); r.raise_for_status(); d=r.json()
@@ -58,7 +61,7 @@ def cancel_all(c):
     return n
 
 def eligibility(c):
-    # Official docs say admitted accounts only may trade while a round is ACTIVE.
+    # This endpoint is optional; the authoritative trading gate is the official nonce/order 403 response.
     for path in ('/competition/queue-position','/competition/queue_position'):
         try:
             r=c.get(BASE+path)
@@ -76,18 +79,27 @@ def nonce(c):
     r.raise_for_status(); d=r.json(); n=d.get('nonce') if isinstance(d,dict) else None
     return (str(n),None) if n else (None,{'status':'ERROR','reason':'nonce_missing'})
 
-def place(c,side,qty,typ,price=0.):
+def place(c,property_id,side,qty,typ,price=0.):
     n,err=nonce(c)
     if err:return err
-    body={'tokenName':MARKET,'quantity':round(qty,8),'side':side,'type':typ,'timeInForce':'GTC','deadline':0,'nonce':n,'price':round(price,8) if typ=='LIMIT' else 0}
-    r=c.post(f'{BASE}/orders',json=body)
+    body={
+        'propertyId':int(property_id),
+        'quantity':round(qty,8),
+        'side':side,
+        'type':typ,
+        'timeInForce':'GTC',
+        'deadline':0,
+        'nonce':n,
+        'price':round(price,8) if typ=='LIMIT' else 0,
+    }
+    r=c.post(f'{BASE}/orders/',json=body)
     if r.status_code==403:return {'status':'TRADING_GATE_CLOSED','body':r.text[:250]}
     if r.status_code==503:
         # Never blind-retry ambiguous placement. Reconcile active orders first.
         return {'status':'AMBIGUOUS_503','activeOrdersAfter503':len(active_orders(c))}
     r.raise_for_status(); d=r.json()
     if not isinstance(d,dict) or not d.get('success'):return {'status':'ORDER_REJECTED','response':d}
-    return {'status':'ORDER_ACCEPTED','orderId':d.get('orderId'),'side':side,'type':typ,'quantity':round(qty,8),'price':body['price']}
+    return {'status':'ORDER_ACCEPTED','orderId':d.get('orderId'),'side':side,'type':typ,'quantity':round(qty,8),'price':body['price'],'propertyId':int(property_id)}
 
 def passive(side,bid,ask):
     mid=(bid+ask)/2; imp=QUOTE_IMPROVEMENT_BPS/10000
@@ -98,20 +110,20 @@ def depth_notional(side,bid,ask,bq,aq,desired):
     if px<=0:return 0
     return min(desired,MAX_TAKER_NOTIONAL,px*q*DEPTH_FRACTION) if q>0 else min(desired,TAKER_NOTIONAL)
 
-def maker(c,side,bid,ask):
-    px=passive(side,bid,ask); p=place(c,side,MAKER_NOTIONAL/px,'LIMIT',px); log({'event':'MAKER_ATTEMPT',**p})
+def maker(c,property_id,side,bid,ask):
+    px=passive(side,bid,ask); p=place(c,property_id,side,MAKER_NOTIONAL/px,'LIMIT',px); log({'event':'MAKER_ATTEMPT',**p})
     if p.get('status') in ('TRADING_GATE_CLOSED','AMBIGUOUS_503'):raise RuntimeError(p['status'])
     if p.get('status')!='ORDER_ACCEPTED':return 0
     oid=p.get('orderId');time.sleep(MAKER_REST_SECONDS)
     if any(str(o.get('orderId'))==str(oid) for o in active_orders(c)):cancel_order(c,oid);return 0
     return MAKER_NOTIONAL
 
-def taker_pair(c,bid,ask,bq,aq,desired):
+def taker_pair(c,property_id,bid,ask,bq,aq,desired):
     cancel_all(c); n=min(depth_notional('BUY',bid,ask,bq,aq,desired),depth_notional('SELL',bid,ask,bq,aq,desired))
     if n<50:return 0
-    qty=n/ask; b=place(c,'BUY',qty,'MARKET');log({'event':'TAKER_BUY',**b})
+    qty=n/ask; b=place(c,property_id,'BUY',qty,'MARKET');log({'event':'TAKER_BUY',**b})
     if b.get('status')!='ORDER_ACCEPTED':raise RuntimeError(b.get('status','buy_failed'))
-    time.sleep(.75); s=place(c,'SELL',qty,'MARKET');log({'event':'TAKER_SELL',**s})
+    time.sleep(.75); s=place(c,property_id,'SELL',qty,'MARKET');log({'event':'TAKER_SELL',**s})
     if s.get('status')!='ORDER_ACCEPTED':raise RuntimeError('flatten_failed')
     return n+qty*bid
 
@@ -119,29 +131,29 @@ def main():
     if not TOKEN:raise SystemExit('LOAF_API_KEY missing')
     now=datetime.now(timezone.utc); headers={'Authorization':f'Bearer {TOKEN}'}
     with httpx.Client(timeout=15,headers=headers) as c:
-        if now<START_UTC:log({'status':'WAITING_FOR_START'});return
+        if now<START_UTC:log({'status':'WAITING_FOR_START','officialStartUtc':START_UTC.isoformat()});return
         if now>=END_UTC:log({'status':'ROUND_ENDED_CLEAN','ordersCancelled':cancel_all(c)});return
         admitted,elig=eligibility(c);log({'event':'ELIGIBILITY_CHECK','resolved':admitted,'detail':elig})
         if admitted is False:log({'status':'STOP','reason':'competition_not_admitted'});return
-        cancel_all(c);tgt=target5();started=time.monotonic();vol=0.;errors=empty=0;side='BUY'
-        log({'event':'SESSION_START','market':MARKET,'sessionTargetVolume':round(tgt,2),'protocol':'official-tokenName-rest','safety':'fresh_nonce + reconcile_503 + competition_gate'})
+        cancel_all(c);tgt=target5();started=time.monotonic();vol=0.;errors=empty=0;side='BUY';property_id=None
+        log({'event':'SESSION_START','market':MARKET,'sessionTargetVolume':round(tgt,2),'protocol':'official-propertyId-rest','safety':'fresh_nonce + reconcile_503 + competition_gate'})
         while time.monotonic()-started<SESSION_BUDGET_SECONDS:
             try:
-                trade,bid,ask,bq,aq,bl,al=read_market(c)
+                property_id,trade,bid,ask,bq,aq,bl,al=read_market(c)
                 competition_active=bool(trade.get('competitionModeActive',False)) if isinstance(trade,dict) else False
                 if not competition_active:
-                    log({'status':'WAITING_FOR_COMPETITION','competitionModeActive':False});return
+                    log({'status':'WAITING_FOR_COMPETITION','competitionModeActive':False,'propertyId':property_id});return
                 if bid<=0 or ask<=bid:
-                    empty+=1;log({'status':'SKIP','reason':'no_safe_two_sided_book','bidLevels':bl,'askLevels':al})
+                    empty+=1;log({'status':'SKIP','reason':'no_safe_two_sided_book','propertyId':property_id,'bidLevels':bl,'askLevels':al})
                     if empty>=MAX_EMPTY_BOOKS:return
                     time.sleep(COOLDOWN_SECONDS);continue
                 empty=0;spread=(ask-bid)/((ask+bid)/2)*100;ratio=min(1,(time.monotonic()-started)/SESSION_BUDGET_SECONDS);deficit=max(0,tgt*ratio-vol)
-                if spread<=MAX_MAKER_SPREAD_PCT:vol+=maker(c,side,bid,ask);side='SELL' if side=='BUY' else 'BUY'
-                if deficit>TAKER_NOTIONAL and spread<=MAX_TAKER_SPREAD_PCT:vol+=taker_pair(c,bid,ask,bq,aq,min(MAX_TAKER_NOTIONAL,max(TAKER_NOTIONAL,deficit/2)))
+                if spread<=MAX_MAKER_SPREAD_PCT:vol+=maker(c,property_id,side,bid,ask);side='SELL' if side=='BUY' else 'BUY'
+                if deficit>TAKER_NOTIONAL and spread<=MAX_TAKER_SPREAD_PCT:vol+=taker_pair(c,property_id,bid,ask,bq,aq,min(MAX_TAKER_NOTIONAL,max(TAKER_NOTIONAL,deficit/2)))
                 errors=0;time.sleep(COOLDOWN_SECONDS)
             except Exception as e:
-                errors+=1;log({'event':'ENGINE_ERROR','error':str(e),'errors':errors})
+                errors+=1;log({'event':'ENGINE_ERROR','error':str(e),'errors':errors,'propertyId':property_id})
                 if errors>=MAX_ERRORS:cancel_all(c);log({'status':'KILL_SWITCH'});return
                 time.sleep(COOLDOWN_SECONDS)
-        cancel_all(c);log({'status':'SESSION_COMPLETE','estimatedVolume':round(vol,2),'target':round(tgt,2)})
+        cancel_all(c);log({'status':'SESSION_COMPLETE','estimatedVolume':round(vol,2),'target':round(tgt,2),'propertyId':property_id})
 if __name__=='__main__':main()
