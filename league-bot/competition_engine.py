@@ -27,19 +27,104 @@ def fnum(v,d=0.):
     try:return float(v or d)
     except:return d
 
+def as_property_id(v):
+    if v is None or isinstance(v,bool):return None
+    try:
+        n=int(v);return n if n>=0 else None
+    except:return None
+
+def find_property_id(node,market=None):
+    if isinstance(node,dict):
+        normalized={str(k).lower().replace('_',''):k for k in node}
+        for candidate in ('propertyid','propertyidentifier'):
+            key=normalized.get(candidate)
+            if key is not None:
+                parsed=as_property_id(node.get(key))
+                if parsed is not None:return parsed
+        if market:
+            names=[]
+            for key in ('tokenName','token_name','token','symbol','slug','name'):
+                v=node.get(key)
+                if isinstance(v,str):names.append(v.strip().lower())
+            if market.strip().lower() in names:
+                for key in ('id','property','property_id'):
+                    if key in node:
+                        parsed=as_property_id(node.get(key))
+                        if parsed is not None:return parsed
+        preferred=('data','result','market','property','header','payload')
+        for key in preferred:
+            if key in node:
+                found=find_property_id(node[key],market)
+                if found is not None:return found
+        for key,value in node.items():
+            if key not in preferred:
+                found=find_property_id(value,market)
+                if found is not None:return found
+    elif isinstance(node,list):
+        for value in node:
+            found=find_property_id(value,market)
+            if found is not None:return found
+    return None
+
+def find_book(node):
+    if isinstance(node,dict):
+        lower={str(k).lower():k for k in node}
+        bk=next((lower[k] for k in ('bids','buyorders','buy_orders') if k in lower),None)
+        ak=next((lower[k] for k in ('asks','sellorders','sell_orders') if k in lower),None)
+        if bk is not None or ak is not None:
+            return node.get(bk,[]) if bk is not None else [],node.get(ak,[]) if ak is not None else []
+        for value in node.values():
+            found=find_book(value)
+            if found is not None:return found
+    elif isinstance(node,list):
+        for value in node:
+            found=find_book(value)
+            if found is not None:return found
+    return None
+
+def find_flag(node,key):
+    if isinstance(node,dict):
+        if key in node:return bool(node.get(key))
+        for value in node.values():
+            found=find_flag(value,key)
+            if found is not None:return found
+    elif isinstance(node,list):
+        for value in node:
+            found=find_flag(value,key)
+            if found is not None:return found
+    return None
+
+def resolve_property_id(c,header,trade=None):
+    env=os.getenv('LOAF_PROPERTY_ID')
+    if env:
+        parsed=as_property_id(env)
+        if parsed is not None:return parsed,'env'
+    for source,payload in (('info_header',header),('trade_snapshot',trade)):
+        if payload is not None:
+            found=find_property_id(payload,MARKET)
+            if found is not None:return found,source
+    # BASE already ends in /api in production.
+    try:
+        r=c.get(f'{BASE}/trade');
+        if r.status_code<400:
+            found=find_property_id(r.json(),MARKET)
+            if found is not None:return found,'trade_list'
+    except (httpx.HTTPError,ValueError):pass
+    return None,'unresolved'
+
 def read_market(c):
     h=c.get(f'{BASE}/info/{MARKET}/header'); h.raise_for_status(); header=h.json()
-    property_id=header.get('propertyId') if isinstance(header,dict) else None
-    if property_id is None:
-        raise RuntimeError('propertyId_missing_from_info_header')
-    t=c.get(f'{BASE}/trade/{MARKET}'); t.raise_for_status(); trade=t.json(); book=trade.get('orderBook') or {}
+    t=c.get(f'{BASE}/trade/{MARKET}'); t.raise_for_status(); trade=t.json()
+    property_id,source=resolve_property_id(c,header,trade)
+    if property_id is None:raise RuntimeError('propertyId_unresolved')
+    found=find_book(trade); bids_raw,asks_raw=found if found is not None else ([],[])
     def pq(x):
-        if isinstance(x,dict): return fnum(x.get('price')),fnum(x.get('quantity'))
+        if isinstance(x,dict): return fnum(x.get('price',x.get('px',x.get('p')))),fnum(x.get('quantity',x.get('qty',x.get('q'))))
         return (fnum(x[0]),fnum(x[1]) if len(x)>1 else 0) if isinstance(x,(list,tuple)) and x else (0,0)
-    bids=[pq(x) for x in book.get('bids') or []]; asks=[pq(x) for x in book.get('asks') or []]
+    bids=[pq(x) for x in bids_raw or []]; asks=[pq(x) for x in asks_raw or []]
     bids=[x for x in bids if x[0]>0]; asks=[x for x in asks if x[0]>0]
     bid,bq=max(bids,key=lambda x:x[0]) if bids else (0,0); ask,aq=min(asks,key=lambda x:x[0]) if asks else (0,0)
-    return int(property_id),trade,bid,ask,bq,aq,len(bids),len(asks)
+    return int(property_id),source,trade,bid,ask,bq,aq,len(bids),len(asks)
 
 def active_orders(c):
     r=c.get(f'{BASE}/history/orders/active'); r.raise_for_status(); d=r.json()
@@ -61,7 +146,6 @@ def cancel_all(c):
     return n
 
 def eligibility(c):
-    # This endpoint is optional; the authoritative trading gate is the official nonce/order 403 response.
     for path in ('/competition/queue-position','/competition/queue_position'):
         try:
             r=c.get(BASE+path)
@@ -82,21 +166,10 @@ def nonce(c):
 def place(c,property_id,side,qty,typ,price=0.):
     n,err=nonce(c)
     if err:return err
-    body={
-        'propertyId':int(property_id),
-        'quantity':round(qty,8),
-        'side':side,
-        'type':typ,
-        'timeInForce':'GTC',
-        'deadline':0,
-        'nonce':n,
-        'price':round(price,8) if typ=='LIMIT' else 0,
-    }
+    body={'propertyId':int(property_id),'quantity':round(qty,8),'side':side,'type':typ,'timeInForce':'GTC','deadline':0,'nonce':n,'price':round(price,8) if typ=='LIMIT' else 0}
     r=c.post(f'{BASE}/orders/',json=body)
     if r.status_code==403:return {'status':'TRADING_GATE_CLOSED','body':r.text[:250]}
-    if r.status_code==503:
-        # Never blind-retry ambiguous placement. Reconcile active orders first.
-        return {'status':'AMBIGUOUS_503','activeOrdersAfter503':len(active_orders(c))}
+    if r.status_code==503:return {'status':'AMBIGUOUS_503','activeOrdersAfter503':len(active_orders(c))}
     r.raise_for_status(); d=r.json()
     if not isinstance(d,dict) or not d.get('success'):return {'status':'ORDER_REJECTED','response':d}
     return {'status':'ORDER_ACCEPTED','orderId':d.get('orderId'),'side':side,'type':typ,'quantity':round(qty,8),'price':body['price'],'propertyId':int(property_id)}
@@ -139,12 +212,12 @@ def main():
         log({'event':'SESSION_START','market':MARKET,'sessionTargetVolume':round(tgt,2),'protocol':'official-propertyId-rest','safety':'fresh_nonce + reconcile_503 + competition_gate'})
         while time.monotonic()-started<SESSION_BUDGET_SECONDS:
             try:
-                property_id,trade,bid,ask,bq,aq,bl,al=read_market(c)
-                competition_active=bool(trade.get('competitionModeActive',False)) if isinstance(trade,dict) else False
-                if not competition_active:
-                    log({'status':'WAITING_FOR_COMPETITION','competitionModeActive':False,'propertyId':property_id});return
+                property_id,property_source,trade,bid,ask,bq,aq,bl,al=read_market(c)
+                competition_active=find_flag(trade,'competitionModeActive')
+                if competition_active is not True:
+                    log({'status':'WAITING_FOR_COMPETITION','competitionModeActive':competition_active,'propertyId':property_id,'propertyIdSource':property_source});return
                 if bid<=0 or ask<=bid:
-                    empty+=1;log({'status':'SKIP','reason':'no_safe_two_sided_book','propertyId':property_id,'bidLevels':bl,'askLevels':al})
+                    empty+=1;log({'status':'SKIP','reason':'no_safe_two_sided_book','propertyId':property_id,'propertyIdSource':property_source,'bidLevels':bl,'askLevels':al})
                     if empty>=MAX_EMPTY_BOOKS:return
                     time.sleep(COOLDOWN_SECONDS);continue
                 empty=0;spread=(ask-bid)/((ask+bid)/2)*100;ratio=min(1,(time.monotonic()-started)/SESSION_BUDGET_SECONDS);deficit=max(0,tgt*ratio-vol)
