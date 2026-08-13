@@ -15,7 +15,6 @@ TAKER_NOTIONAL=float(os.getenv('LOAF_ENGINE_TAKER_NOTIONAL','1250'))
 MAX_TAKER_NOTIONAL=float(os.getenv('LOAF_ENGINE_MAX_TAKER_NOTIONAL','2000'))
 MAX_MAKER_SPREAD_PCT=float(os.getenv('LOAF_ENGINE_MAX_MAKER_SPREAD_PCT','1.0'))
 MAX_TAKER_SPREAD_PCT=float(os.getenv('LOAF_ENGINE_MAX_TAKER_SPREAD_PCT','0.10'))
-QUOTE_IMPROVEMENT_BPS=float(os.getenv('LOAF_ENGINE_QUOTE_IMPROVEMENT_BPS','1'))
 MAKER_REST_SECONDS=int(os.getenv('LOAF_ENGINE_MAKER_REST_SECONDS','5'))
 COOLDOWN_SECONDS=float(os.getenv('LOAF_ENGINE_COOLDOWN_SECONDS','1.5'))
 MAX_ERRORS=int(os.getenv('LOAF_ENGINE_MAX_ERRORS','3'))
@@ -103,9 +102,8 @@ def resolve_property_id(c,header,trade=None):
         if payload is not None:
             found=find_property_id(payload,MARKET)
             if found is not None:return found,source
-    # BASE already ends in /api in production.
     try:
-        r=c.get(f'{BASE}/trade');
+        r=c.get(f'{BASE}/trade')
         if r.status_code<400:
             found=find_property_id(r.json(),MARKET)
             if found is not None:return found,'trade_list'
@@ -159,24 +157,27 @@ def eligibility(c):
 
 def nonce(c):
     r=c.post(f'{BASE}/orders/nonce')
-    if r.status_code==403:return None,{'status':'TRADING_GATE_CLOSED','body':r.text[:250]}
-    r.raise_for_status(); d=r.json(); n=d.get('nonce') if isinstance(d,dict) else None
-    return (str(n),None) if n else (None,{'status':'ERROR','reason':'nonce_missing'})
+    if r.status_code==403:return None,None,{'status':'TRADING_GATE_CLOSED','body':r.text[:250]}
+    if r.status_code>=400:return None,None,{'status':'NONCE_HTTP_ERROR','httpStatus':r.status_code,'body':r.text[:500]}
+    d=r.json(); n=d.get('nonce') if isinstance(d,dict) else None
+    deadline=d.get('deadline',0) if isinstance(d,dict) else 0
+    return (str(n),deadline,None) if n else (None,deadline,{'status':'ERROR','reason':'nonce_missing','body':d})
 
 def place(c,property_id,side,qty,typ,price=0.):
-    n,err=nonce(c)
+    n,deadline,err=nonce(c)
     if err:return err
-    body={'propertyId':int(property_id),'quantity':round(qty,8),'side':side,'type':typ,'timeInForce':'GTC','deadline':0,'nonce':n,'price':round(price,8) if typ=='LIMIT' else 0}
+    body={'propertyId':int(property_id),'quantity':round(qty,8),'side':side,'type':typ,'timeInForce':'GTC','deadline':deadline or 0,'nonce':n,'price':round(price,2) if typ=='LIMIT' else 0}
     r=c.post(f'{BASE}/orders/',json=body)
-    if r.status_code==403:return {'status':'TRADING_GATE_CLOSED','body':r.text[:250]}
+    if r.status_code==403:return {'status':'TRADING_GATE_CLOSED','body':r.text[:500]}
     if r.status_code==503:return {'status':'AMBIGUOUS_503','activeOrdersAfter503':len(active_orders(c))}
-    r.raise_for_status(); d=r.json()
+    if r.status_code>=400:return {'status':'ORDER_HTTP_ERROR','httpStatus':r.status_code,'body':r.text[:1000],'request':{k:v for k,v in body.items() if k!='nonce'}}
+    try:d=r.json()
+    except ValueError:d={'raw':r.text[:1000]}
     if not isinstance(d,dict) or not d.get('success'):return {'status':'ORDER_REJECTED','response':d}
     return {'status':'ORDER_ACCEPTED','orderId':d.get('orderId'),'side':side,'type':typ,'quantity':round(qty,8),'price':body['price'],'propertyId':int(property_id)}
 
 def passive(side,bid,ask):
-    mid=(bid+ask)/2; imp=QUOTE_IMPROVEMENT_BPS/10000
-    return min(bid*(1+imp),mid*.999999,ask*.999999) if side=='BUY' else max(ask*(1-imp),mid*1.000001,bid*1.000001)
+    return round(bid if side=='BUY' else ask,2)
 def target5():return ROUND_VOLUME_TARGET/((END_UTC-START_UTC).total_seconds()/300)
 def depth_notional(side,bid,ask,bq,aq,desired):
     px,q=(ask,aq) if side=='BUY' else (bid,bq)
@@ -185,7 +186,7 @@ def depth_notional(side,bid,ask,bq,aq,desired):
 
 def maker(c,property_id,side,bid,ask):
     px=passive(side,bid,ask); p=place(c,property_id,side,MAKER_NOTIONAL/px,'LIMIT',px); log({'event':'MAKER_ATTEMPT',**p})
-    if p.get('status') in ('TRADING_GATE_CLOSED','AMBIGUOUS_503'):raise RuntimeError(p['status'])
+    if p.get('status') in ('TRADING_GATE_CLOSED','AMBIGUOUS_503','NONCE_HTTP_ERROR','ORDER_HTTP_ERROR'):raise RuntimeError(json.dumps(p,separators=(',',':')))
     if p.get('status')!='ORDER_ACCEPTED':return 0
     oid=p.get('orderId');time.sleep(MAKER_REST_SECONDS)
     if any(str(o.get('orderId'))==str(oid) for o in active_orders(c)):cancel_order(c,oid);return 0
@@ -195,9 +196,9 @@ def taker_pair(c,property_id,bid,ask,bq,aq,desired):
     cancel_all(c); n=min(depth_notional('BUY',bid,ask,bq,aq,desired),depth_notional('SELL',bid,ask,bq,aq,desired))
     if n<50:return 0
     qty=n/ask; b=place(c,property_id,'BUY',qty,'MARKET');log({'event':'TAKER_BUY',**b})
-    if b.get('status')!='ORDER_ACCEPTED':raise RuntimeError(b.get('status','buy_failed'))
+    if b.get('status')!='ORDER_ACCEPTED':raise RuntimeError(json.dumps(b,separators=(',',':')))
     time.sleep(.75); s=place(c,property_id,'SELL',qty,'MARKET');log({'event':'TAKER_SELL',**s})
-    if s.get('status')!='ORDER_ACCEPTED':raise RuntimeError('flatten_failed')
+    if s.get('status')!='ORDER_ACCEPTED':raise RuntimeError(json.dumps(s,separators=(',',':')))
     return n+qty*bid
 
 def main():
