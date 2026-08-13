@@ -18,6 +18,8 @@ TARGET_INVENTORY=float(os.getenv('LOAF_ENGINE_TARGET_INVENTORY','20'))
 INVENTORY_BAND=float(os.getenv('LOAF_ENGINE_INVENTORY_BAND','5'))
 MAX_INVENTORY=float(os.getenv('LOAF_ENGINE_MAX_INVENTORY','50'))
 MIN_INVENTORY=float(os.getenv('LOAF_ENGINE_MIN_INVENTORY','0'))
+SELL_UTILIZATION=float(os.getenv('LOAF_ENGINE_SELL_UTILIZATION','0.90'))
+SELL_RESERVE_UNITS=float(os.getenv('LOAF_ENGINE_SELL_RESERVE_UNITS','0.5'))
 
 
 def log(x): print(json.dumps(x,separators=(',',':'),default=str),flush=True)
@@ -117,7 +119,6 @@ def active_orders(c):
 def cancel_order(c,oid):
     r=c.post(f'{BASE}/orders/cancel',json={'orderId':oid})
     if r.status_code in (200,201,204,404):return True
-    # A raced fill/cancel can produce 400. Reconcile instead of failing blindly.
     if r.status_code==400:
         still_open=any(str(o.get('orderId'))==str(oid) for o in active_orders(c))
         if not still_open:return True
@@ -171,13 +172,28 @@ def choose_side(inv,last_side):
 def quote_once(c,side,bid,ask,inv_before):
     px=bid if side=='BUY' else ask
     if px<=0:return 0,inv_before
-    max_qty=(MAX_INVENTORY-inv_before) if side=='BUY' else (inv_before-MIN_INVENTORY)
-    qty=min(MAKER_NOTIONAL/px,max(0,max_qty))
+    if side=='SELL':
+        # Existing asks can reserve inventory even when portfolio shows the units.
+        # Reconcile/cancel first, then leave a small reserve and only quote a fraction
+        # of the refreshed inventory so a raced reservation cannot cause overselling.
+        cancelled=cancel_all(c)
+        if cancelled:time.sleep(0.75)
+        refreshed,_=portfolio_inventory(c)
+        if refreshed is None:raise RuntimeError('inventory_unresolved_before_sell')
+        inv_before=refreshed
+        available=max(0.0,inv_before-MIN_INVENTORY-SELL_RESERVE_UNITS)
+        max_qty=available*max(0.0,min(1.0,SELL_UTILIZATION))
+    else:
+        max_qty=max(0.0,MAX_INVENTORY-inv_before)
+    qty=min(MAKER_NOTIONAL/px,max_qty)
     qty=round(qty,1)
     if qty<0.1:
-        log({'event':'RISK_SKIP','side':side,'inventory':inv_before,'reason':'inventory_limit'});return 0,inv_before
+        log({'event':'RISK_SKIP','side':side,'inventory':round(inv_before,4),'reason':'inventory_limit'});return 0,inv_before
     p=place(c,side,qty,px);log({'event':'MAKER_ATTEMPT','inventoryBefore':round(inv_before,4),**p})
     if p.get('status')!='ORDER_ACCEPTED':
+        if p.get('status')=='ORDER_HTTP_ERROR' and side=='SELL' and 'Insufficient available balance' in str(p.get('body','')):
+            log({'event':'INVENTORY_RESERVED','inventory':round(inv_before,4),'attemptedQty':qty,'action':'skip_without_kill_switch'})
+            time.sleep(max(COOLDOWN_SECONDS,1.0));return 0,inv_before
         if p.get('status') in ('TRADING_GATE_CLOSED','AMBIGUOUS_503','NONCE_HTTP_ERROR','ORDER_HTTP_ERROR'):
             raise RuntimeError(json.dumps(p,separators=(',',':')))
         return 0,inv_before
@@ -188,7 +204,6 @@ def quote_once(c,side,bid,ask,inv_before):
     inv_after,_=portfolio_inventory(c)
     if inv_after is None:raise RuntimeError('inventory_unresolved_after_order')
     delta=inv_after-inv_before
-    # Count only observed portfolio change; accepted != filled.
     filled_units=max(0,delta) if side=='BUY' else max(0,-delta)
     filled_notional=filled_units*px
     log({'event':'FILL_RECONCILE','side':side,'inventoryBefore':round(inv_before,4),'inventoryAfter':round(inv_after,4),'filledUnits':round(filled_units,4),'filledNotional':round(filled_notional,2)})
@@ -206,8 +221,8 @@ def main():
         if inv is None:
             log({'status':'STOP','reason':'portfolio_inventory_unresolved','portfolioKeys':list(portfolio.keys()) if isinstance(portfolio,dict) else type(portfolio).__name__});return
         cancel_all(c)
-        started=time.monotonic();volume=0.;errors=0;last_side='SELL'
-        log({'event':'SESSION_START','market':MARKET,'inventory':round(inv,4),'mode':'passive_inventory_aware_market_making','safety':'portfolio_reconcile + max_inventory + no_taker_loop'})
+        started=time.monotonic();volume=0.;errors=0;last_side='SELL';session_start_inv=inv
+        log({'event':'SESSION_START','market':MARKET,'inventory':round(inv,4),'mode':'passive_inventory_aware_market_making','safety':'portfolio_reconcile + max_inventory + reserved_inventory_guard + no_taker_loop'})
         while time.monotonic()-started<SESSION_BUDGET_SECONDS:
             try:
                 trade,bid,ask,bl,al=read_market(c)
@@ -232,5 +247,5 @@ def main():
                 time.sleep(COOLDOWN_SECONDS)
         cancel_all(c)
         final_inv,_=portfolio_inventory(c)
-        log({'status':'SESSION_COMPLETE','observedFilledNotional':round(volume,2),'inventoryStart':round(inv,4),'inventoryEnd':round(final_inv if final_inv is not None else inv,4)})
+        log({'status':'SESSION_COMPLETE','observedFilledNotional':round(volume,2),'inventoryStart':round(session_start_inv,4),'inventoryEnd':round(final_inv if final_inv is not None else inv,4)})
 if __name__=='__main__':main()
