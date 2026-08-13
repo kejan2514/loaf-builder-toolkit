@@ -22,12 +22,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install dependency
-        run: pip install 'httpx>=0.27,<1'
+      - name: Install dependencies
+        run: pip install 'httpx>=0.27,<1' 'websockets>=13,<16'
       - name: Run Round 1 maker-first hybrid volume engine
         env:
           LOAF_API_KEY: ${{ secrets.LOAF_API_TOKEN }}
           LOAF_API_BASE_URL: https://api.loafmarkets.com/api
+          LOAF_WS_URL: wss://api.loafmarkets.com/ws
           LOAF_TARGET_TOKEN: terafab
           LOAF_ENGINE_SESSION_BUDGET_SECONDS: '240'
           LOAF_ENGINE_MAKER_NOTIONAL: '4500'
@@ -39,4 +40,5 @@ jobs:
           LOAF_ENGINE_INVENTORY_BAND: '5'
           LOAF_ENGINE_MAX_INVENTORY: '50'
           LOAF_ENGINE_MIN_INVENTORY: '0'
+          LOAF_ENGINE_WS_STALE_SECONDS: '4'
         run: python league-bot/competition_engine.py
