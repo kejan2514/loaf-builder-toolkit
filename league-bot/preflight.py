@@ -79,6 +79,88 @@ def snapshot_shape(node, depth=0, max_depth=3):
     return type(node).__name__
 
 
+def _as_property_id(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+        return parsed if parsed >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def find_property_id(node, market: str | None = None):
+    """Resolve propertyId across direct and wrapped Loaf API response shapes."""
+    if isinstance(node, dict):
+        # Prefer explicit property-id fields at every level.
+        normalized = {str(k).lower().replace("_", ""): k for k in node.keys()}
+        for candidate in ("propertyid", "propertyidentifier"):
+            key = normalized.get(candidate)
+            if key is not None:
+                parsed = _as_property_id(node.get(key))
+                if parsed is not None:
+                    return parsed
+
+        # If this looks like a market object and the token matches, accept its numeric id.
+        if market:
+            names = []
+            for key in ("tokenName", "token_name", "token", "symbol", "slug", "name"):
+                value = node.get(key)
+                if isinstance(value, str):
+                    names.append(value.strip().lower())
+            if market.strip().lower() in names:
+                for key in ("id", "property", "property_id"):
+                    if key in node:
+                        parsed = _as_property_id(node.get(key))
+                        if parsed is not None:
+                            return parsed
+
+        # Common wrappers are checked first, then the rest recursively.
+        for key in ("data", "result", "market", "property", "header", "payload"):
+            if key in node:
+                found = find_property_id(node[key], market)
+                if found is not None:
+                    return found
+        for key, value in node.items():
+            if key not in ("data", "result", "market", "property", "header", "payload"):
+                found = find_property_id(value, market)
+                if found is not None:
+                    return found
+
+    elif isinstance(node, list):
+        for value in node:
+            found = find_property_id(value, market)
+            if found is not None:
+                return found
+    return None
+
+
+def resolve_property_id(client: httpx.Client, header) -> tuple[int | None, str]:
+    env_value = os.getenv("LOAF_PROPERTY_ID")
+    if env_value:
+        parsed = _as_property_id(env_value)
+        if parsed is not None:
+            return parsed, "env"
+
+    found = find_property_id(header, MARKET)
+    if found is not None:
+        return found, "info_header"
+
+    # Fallback: Loaf's public trade endpoints can expose the market object even
+    # when the Info endpoint changes its response wrapper.
+    for path in (f"/api/trade/{MARKET}", "/api/trade"):
+        try:
+            response = client.get(f"{BASE}{path}")
+            response.raise_for_status()
+            found = find_property_id(response.json(), MARKET)
+            if found is not None:
+                return found, path
+        except (httpx.HTTPError, ValueError):
+            continue
+
+    return None, "unresolved"
+
+
 def read_book(client: httpx.Client, debug=False) -> tuple[float, float]:
     r = client.get(f"{BASE}/api/trade/{MARKET}")
     r.raise_for_status()
@@ -100,16 +182,23 @@ def main() -> None:
         h = client.get(f"{BASE}/api/info/{MARKET}/header")
         h.raise_for_status()
         header = h.json()
-        property_id = header.get("propertyId") if isinstance(header, dict) else None
+        property_id, property_id_source = resolve_property_id(client, header)
         if property_id is None:
             print(json.dumps({
                 "status": "NOT_READY",
-                "reason": "propertyId_missing_from_market_header",
+                "reason": "propertyId_unresolved",
                 "market": MARKET,
                 "apiBase": BASE,
+                "headerShape": snapshot_shape(header),
+                "nextAction": "Set LOAF_PROPERTY_ID explicitly or inspect the current Loaf market metadata schema",
             }, indent=2))
             sys.exit(1)
-        print(json.dumps({"market": MARKET, "propertyId": property_id, "apiBase": BASE}))
+        print(json.dumps({
+            "market": MARKET,
+            "propertyId": property_id,
+            "propertyIdSource": property_id_source,
+            "apiBase": BASE,
+        }))
 
         mids: list[float] = []
         spreads: list[float] = []
@@ -134,7 +223,7 @@ def main() -> None:
             print(json.dumps({
                 "status": "NOT_READY",
                 "reason": "REST snapshot still has no safe two-sided quotes",
-                "nextAction": "Use the official Loaf WebSocket orderbook feed (orderbook:{propertyId})"
+                "nextAction": f"Use the official Loaf WebSocket orderbook feed (orderbook:{property_id})"
             }, indent=2))
             return
 
@@ -207,6 +296,7 @@ def main() -> None:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "market": MARKET,
             "propertyId": property_id,
+            "propertyIdSource": property_id_source,
             "status": "READY_FOR_TINY_LIVE_PILOT" if ready else "NOT_READY",
             "calibrationQuoteReadyRatePct": round(ready_rate, 2),
             "shadowQuoteReadyRatePct": round(shadow_ready_rate, 2),
