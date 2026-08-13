@@ -166,15 +166,17 @@ def nonce(c):
 def place(c,property_id,side,qty,typ,price=0.):
     n,deadline,err=nonce(c)
     if err:return err
-    body={'propertyId':int(property_id),'quantity':round(qty,8),'side':side,'type':typ,'timeInForce':'GTC','deadline':deadline or 0,'nonce':n,'price':round(price,2) if typ=='LIMIT' else 0}
+    # Current competition API validator identifies the asset by tokenName.
+    # Do not send propertyId here: the live validator rejects it as an unknown key.
+    body={'tokenName':MARKET,'quantity':round(qty,8),'side':side,'type':typ,'timeInForce':'GTC','deadline':deadline or 0,'nonce':n,'price':round(price,2) if typ=='LIMIT' else 0}
     r=c.post(f'{BASE}/orders/',json=body)
     if r.status_code==403:return {'status':'TRADING_GATE_CLOSED','body':r.text[:500]}
     if r.status_code==503:return {'status':'AMBIGUOUS_503','activeOrdersAfter503':len(active_orders(c))}
-    if r.status_code>=400:return {'status':'ORDER_HTTP_ERROR','httpStatus':r.status_code,'body':r.text[:1000],'request':{k:v for k,v in body.items() if k!='nonce'}}
+    if r.status_code>=400:return {'status':'ORDER_HTTP_ERROR','httpStatus':r.status_code,'body':r.text[:1000],'request':{k:v for k,v in body.items() if k!='nonce'},'resolvedPropertyId':int(property_id)}
     try:d=r.json()
     except ValueError:d={'raw':r.text[:1000]}
     if not isinstance(d,dict) or not d.get('success'):return {'status':'ORDER_REJECTED','response':d}
-    return {'status':'ORDER_ACCEPTED','orderId':d.get('orderId'),'side':side,'type':typ,'quantity':round(qty,8),'price':body['price'],'propertyId':int(property_id)}
+    return {'status':'ORDER_ACCEPTED','orderId':d.get('orderId'),'side':side,'type':typ,'quantity':round(qty,8),'price':body['price'],'propertyId':int(property_id),'tokenName':MARKET}
 
 def passive(side,bid,ask):
     return round(bid if side=='BUY' else ask,2)
@@ -210,7 +212,7 @@ def main():
         admitted,elig=eligibility(c);log({'event':'ELIGIBILITY_CHECK','resolved':admitted,'detail':elig})
         if admitted is False:log({'status':'STOP','reason':'competition_not_admitted'});return
         cancel_all(c);tgt=target5();started=time.monotonic();vol=0.;errors=empty=0;side='BUY';property_id=None
-        log({'event':'SESSION_START','market':MARKET,'sessionTargetVolume':round(tgt,2),'protocol':'official-propertyId-rest','safety':'fresh_nonce + reconcile_503 + competition_gate'})
+        log({'event':'SESSION_START','market':MARKET,'sessionTargetVolume':round(tgt,2),'protocol':'tokenName-order-rest','safety':'fresh_nonce + reconcile_503 + competition_gate'})
         while time.monotonic()-started<SESSION_BUDGET_SECONDS:
             try:
                 property_id,property_source,trade,bid,ask,bq,aq,bl,al=read_market(c)
