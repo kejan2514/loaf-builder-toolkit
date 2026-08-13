@@ -165,8 +165,6 @@ def nonce(c):
 def place(c,property_id,side,qty,typ,price=0.):
     n,_nonce_deadline,err=nonce(c)
     if err:return err
-    # Live Loaf validator: tokenName identifies the market, quantity allows max 1 decimal,
-    # and non-GTD (GTC/market) orders must use the API default deadline value.
     body={'tokenName':MARKET,'quantity':round(qty,1),'side':side,'type':typ,'timeInForce':'GTC','deadline':0,'nonce':n,'price':round(price,2) if typ=='LIMIT' else 0}
     r=c.post(f'{BASE}/orders/',json=body)
     if r.status_code==403:return {'status':'TRADING_GATE_CLOSED','body':r.text[:500]}
@@ -186,10 +184,21 @@ def depth_notional(side,bid,ask,bq,aq,desired):
 
 def maker(c,property_id,side,bid,ask):
     px=passive(side,bid,ask); p=place(c,property_id,side,MAKER_NOTIONAL/px,'LIMIT',px); log({'event':'MAKER_ATTEMPT',**p})
-    if p.get('status') in ('TRADING_GATE_CLOSED','AMBIGUOUS_503','NONCE_HTTP_ERROR','ORDER_HTTP_ERROR'):raise RuntimeError(json.dumps(p,separators=(',',':')))
+    if p.get('status') in ('TRADING_GATE_CLOSED','AMBIGUOUS_503','NONCE_HTTP_ERROR'):raise RuntimeError(json.dumps(p,separators=(',',':')))
+    if p.get('status')=='ORDER_HTTP_ERROR':
+        # A BUY fill can take a moment to become sellable inventory. Do not trip the
+        # kill switch on that expected settlement window; keep the side on SELL and retry later.
+        if side=='SELL' and 'Insufficient available balance' in str(p.get('body','')):
+            log({'event':'INVENTORY_NOT_SETTLED','action':'WAIT_AND_RETRY_SELL','propertyId':property_id})
+            time.sleep(max(COOLDOWN_SECONDS,2.0));return 0
+        raise RuntimeError(json.dumps(p,separators=(',',':')))
     if p.get('status')!='ORDER_ACCEPTED':return 0
     oid=p.get('orderId');time.sleep(MAKER_REST_SECONDS)
-    if any(str(o.get('orderId'))==str(oid) for o in active_orders(c)):cancel_order(c,oid);return 0
+    if any(str(o.get('orderId'))==str(oid) for o in active_orders(c)):
+        cancel_order(c,oid);return 0
+    # Order disappeared from active orders: treat as filled, but allow account inventory
+    # state to settle before attempting the opposite side.
+    time.sleep(2.0)
     return MAKER_NOTIONAL
 
 def taker_pair(c,property_id,bid,ask,bq,aq,desired):
@@ -197,7 +206,7 @@ def taker_pair(c,property_id,bid,ask,bq,aq,desired):
     if n<50:return 0
     qty=n/ask; b=place(c,property_id,'BUY',qty,'MARKET');log({'event':'TAKER_BUY',**b})
     if b.get('status')!='ORDER_ACCEPTED':raise RuntimeError(json.dumps(b,separators=(',',':')))
-    time.sleep(.75); s=place(c,property_id,'SELL',qty,'MARKET');log({'event':'TAKER_SELL',**s})
+    time.sleep(2.0); s=place(c,property_id,'SELL',qty,'MARKET');log({'event':'TAKER_SELL',**s})
     if s.get('status')!='ORDER_ACCEPTED':raise RuntimeError(json.dumps(s,separators=(',',':')))
     return n+qty*bid
 
@@ -210,7 +219,7 @@ def main():
         admitted,elig=eligibility(c);log({'event':'ELIGIBILITY_CHECK','resolved':admitted,'detail':elig})
         if admitted is False:log({'status':'STOP','reason':'competition_not_admitted'});return
         cancel_all(c);tgt=target5();started=time.monotonic();vol=0.;errors=empty=0;side='BUY';property_id=None
-        log({'event':'SESSION_START','market':MARKET,'sessionTargetVolume':round(tgt,2),'protocol':'tokenName-order-rest','safety':'fresh_nonce + reconcile_503 + competition_gate'})
+        log({'event':'SESSION_START','market':MARKET,'sessionTargetVolume':round(tgt,2),'protocol':'tokenName-order-rest','safety':'fresh_nonce + reconcile_503 + competition_gate + inventory_settlement_guard'})
         while time.monotonic()-started<SESSION_BUDGET_SECONDS:
             try:
                 property_id,property_source,trade,bid,ask,bq,aq,bl,al=read_market(c)
@@ -222,7 +231,10 @@ def main():
                     if empty>=MAX_EMPTY_BOOKS:return
                     time.sleep(COOLDOWN_SECONDS);continue
                 empty=0;spread=(ask-bid)/((ask+bid)/2)*100;ratio=min(1,(time.monotonic()-started)/SESSION_BUDGET_SECONDS);deficit=max(0,tgt*ratio-vol)
-                if spread<=MAX_MAKER_SPREAD_PCT:vol+=maker(c,property_id,side,bid,ask);side='SELL' if side=='BUY' else 'BUY'
+                if spread<=MAX_MAKER_SPREAD_PCT:
+                    filled=maker(c,property_id,side,bid,ask)
+                    vol+=filled
+                    if filled>0:side='SELL' if side=='BUY' else 'BUY'
                 if deficit>TAKER_NOTIONAL and spread<=MAX_TAKER_SPREAD_PCT:vol+=taker_pair(c,property_id,bid,ask,bq,aq,min(MAX_TAKER_NOTIONAL,max(TAKER_NOTIONAL,deficit/2)))
                 errors=0;time.sleep(COOLDOWN_SECONDS)
             except Exception as e:
