@@ -70,8 +70,7 @@ def find_book(node):
         lower={str(k).lower():k for k in node}
         bk=next((lower[k] for k in ('bids','buyorders','buy_orders') if k in lower),None)
         ak=next((lower[k] for k in ('asks','sellorders','sell_orders') if k in lower),None)
-        if bk is not None or ak is not None:
-            return node.get(bk,[]) if bk is not None else [],node.get(ak,[]) if ak is not None else []
+        if bk is not None or ak is not None:return node.get(bk,[]) if bk is not None else [],node.get(ak,[]) if ak is not None else []
         for value in node.values():
             found=find_book(value)
             if found is not None:return found
@@ -164,11 +163,11 @@ def nonce(c):
     return (str(n),deadline,None) if n else (None,deadline,{'status':'ERROR','reason':'nonce_missing','body':d})
 
 def place(c,property_id,side,qty,typ,price=0.):
-    n,deadline,err=nonce(c)
+    n,_nonce_deadline,err=nonce(c)
     if err:return err
-    # Current competition API validator identifies the asset by tokenName.
-    # Do not send propertyId here: the live validator rejects it as an unknown key.
-    body={'tokenName':MARKET,'quantity':round(qty,8),'side':side,'type':typ,'timeInForce':'GTC','deadline':deadline or 0,'nonce':n,'price':round(price,2) if typ=='LIMIT' else 0}
+    # Live Loaf validator: tokenName identifies the market, quantity allows max 1 decimal,
+    # and non-GTD (GTC/market) orders must use the API default deadline value.
+    body={'tokenName':MARKET,'quantity':round(qty,1),'side':side,'type':typ,'timeInForce':'GTC','deadline':0,'nonce':n,'price':round(price,2) if typ=='LIMIT' else 0}
     r=c.post(f'{BASE}/orders/',json=body)
     if r.status_code==403:return {'status':'TRADING_GATE_CLOSED','body':r.text[:500]}
     if r.status_code==503:return {'status':'AMBIGUOUS_503','activeOrdersAfter503':len(active_orders(c))}
@@ -176,10 +175,9 @@ def place(c,property_id,side,qty,typ,price=0.):
     try:d=r.json()
     except ValueError:d={'raw':r.text[:1000]}
     if not isinstance(d,dict) or not d.get('success'):return {'status':'ORDER_REJECTED','response':d}
-    return {'status':'ORDER_ACCEPTED','orderId':d.get('orderId'),'side':side,'type':typ,'quantity':round(qty,8),'price':body['price'],'propertyId':int(property_id),'tokenName':MARKET}
+    return {'status':'ORDER_ACCEPTED','orderId':d.get('orderId'),'side':side,'type':typ,'quantity':body['quantity'],'price':body['price'],'propertyId':int(property_id),'tokenName':MARKET}
 
-def passive(side,bid,ask):
-    return round(bid if side=='BUY' else ask,2)
+def passive(side,bid,ask):return round(bid if side=='BUY' else ask,2)
 def target5():return ROUND_VOLUME_TARGET/((END_UTC-START_UTC).total_seconds()/300)
 def depth_notional(side,bid,ask,bq,aq,desired):
     px,q=(ask,aq) if side=='BUY' else (bid,bq)
