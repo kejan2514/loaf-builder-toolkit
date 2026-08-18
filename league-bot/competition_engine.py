@@ -1,6 +1,5 @@
 from __future__ import annotations
 import asyncio, json, os, threading, time
-from datetime import datetime, timezone
 from urllib.parse import urlparse
 import httpx
 import websockets
@@ -9,8 +8,6 @@ BASE=os.getenv('LOAF_API_BASE_URL','https://api.loafmarkets.com/api').rstrip('/'
 TOKEN=os.getenv('LOAF_API_KEY','')
 MARKET=os.getenv('LOAF_TARGET_TOKEN','terafab').lower()
 WS_URL=os.getenv('LOAF_WS_URL','')
-START_UTC=datetime(2026,8,13,2,0,0,tzinfo=timezone.utc)
-END_UTC=datetime(2026,8,18,2,0,0,tzinfo=timezone.utc)
 SESSION_BUDGET_SECONDS=int(os.getenv('LOAF_ENGINE_SESSION_BUDGET_SECONDS','210'))
 MAKER_NOTIONAL=float(os.getenv('LOAF_ENGINE_MAKER_NOTIONAL','1500'))
 MAX_MAKER_SPREAD_PCT=float(os.getenv('LOAF_ENGINE_MAX_MAKER_SPREAD_PCT','0.50'))
@@ -27,6 +24,9 @@ MIN_INVENTORY=float(os.getenv('LOAF_ENGINE_MIN_INVENTORY','0'))
 SELL_UTILIZATION=float(os.getenv('LOAF_ENGINE_SELL_UTILIZATION','0.90'))
 SELL_RESERVE_UNITS=float(os.getenv('LOAF_ENGINE_SELL_RESERVE_UNITS','0.5'))
 WS_STALE_SECONDS=float(os.getenv('LOAF_ENGINE_WS_STALE_SECONDS','4'))
+
+class TradingGateClosed(Exception):
+    pass
 
 def log(x): print(json.dumps(x,separators=(',',':'),default=str),flush=True)
 def fnum(v,d=None):
@@ -231,7 +231,8 @@ def quote_once(c,live_book,side,bid,ask,inv_before,feed_source):
     p=place(c,side,qty,px);log({'event':'MAKER_ATTEMPT','feed':feed_source,'inventoryBefore':round(inv_before,4),**p})
     if p.get('status')!='ORDER_ACCEPTED':
         if p.get('status')=='ORDER_HTTP_ERROR' and side=='SELL' and 'Insufficient available balance' in str(p.get('body','')):log({'event':'INVENTORY_RESERVED','inventory':round(inv_before,4),'attemptedQty':qty,'action':'skip_without_kill_switch'});return 0,inv_before
-        if p.get('status') in ('TRADING_GATE_CLOSED','AMBIGUOUS_503','NONCE_HTTP_ERROR','ORDER_HTTP_ERROR'):raise RuntimeError(json.dumps(p,separators=(',',':')))
+        if p.get('status')=='TRADING_GATE_CLOSED':raise TradingGateClosed(str(p.get('body','')))
+        if p.get('status') in ('AMBIGUOUS_503','NONCE_HTTP_ERROR','ORDER_HTTP_ERROR'):raise RuntimeError(json.dumps(p,separators=(',',':')))
         return 0,inv_before
     oid=p.get('orderId');placed=time.monotonic();early_reprice=False
     while time.monotonic()-placed<MAKER_REST_SECONDS:
@@ -254,22 +255,20 @@ def quote_once(c,live_book,side,bid,ask,inv_before,feed_source):
 
 def main():
     if not TOKEN:raise SystemExit('LOAF_API_KEY missing')
-    now=datetime.now(timezone.utc);headers={'Authorization':f'Bearer {TOKEN}'};live_book=LiveOrderBook();live_book.start()
+    headers={'Authorization':f'Bearer {TOKEN}'};live_book=LiveOrderBook();live_book.start()
     try:
         with httpx.Client(timeout=15,headers=headers) as c:
-            if now<START_UTC:log({'status':'WAITING_FOR_START'});return
-            if now>=END_UTC:log({'status':'ROUND_ENDED_CLEAN','ordersCancelled':cancel_all(c)});return
             admitted,elig=eligibility(c);log({'event':'ELIGIBILITY_CHECK','resolved':admitted,'detail':elig})
-            if admitted is False:log({'status':'STOP','reason':'competition_not_admitted'});return
+            if admitted is False:log({'status':'WAITING_FOR_COMPETITION','reason':'competition_not_admitted_or_gate_closed'});return
             inv,portfolio=portfolio_inventory(c)
             if inv is None:log({'status':'STOP','reason':'portfolio_inventory_unresolved','portfolioKeys':list(portfolio.keys()) if isinstance(portfolio,dict) else type(portfolio).__name__});return
             cancel_all(c);time.sleep(1.0);started=time.monotonic();volume=0.;errors=0;last_side='SELL';session_start_inv=inv;last_feed=None
-            log({'event':'SESSION_START','market':MARKET,'inventory':round(inv,4),'mode':'adaptive_passive_inventory_aware_market_making','marketData':'websocket_primary_rest_fallback','safety':'portfolio_reconcile + max_inventory + reserved_inventory_guard + stale_quote_reprice + no_taker_loop'})
+            log({'event':'SESSION_START','market':MARKET,'inventory':round(inv,4),'mode':'adaptive_passive_inventory_aware_market_making','marketData':'websocket_primary_rest_fallback','safety':'competition_gate + portfolio_reconcile + max_inventory + reserved_inventory_guard + stale_quote_reprice + no_taker_loop'})
             while time.monotonic()-started<SESSION_BUDGET_SECONDS:
                 try:
                     trade,bid,ask,bl,al,feed,feed_age=read_market(c,live_book)
                     if feed!=last_feed:log({'event':'MARKET_DATA_SOURCE','source':feed,'wsAgeSeconds':feed_age,'bidLevels':bl,'askLevels':al});last_feed=feed
-                    if find_flag(trade,'competitionModeActive') is not True:log({'status':'WAITING_FOR_COMPETITION'});return
+                    if find_flag(trade,'competitionModeActive') is not True:log({'status':'WAITING_FOR_COMPETITION','reason':'competition_mode_inactive'});return
                     if bid<=0 or ask<=bid:log({'status':'SKIP','reason':'no_safe_two_sided_book','source':feed,'bidLevels':bl,'askLevels':al});time.sleep(COOLDOWN_SECONDS);continue
                     spread=(ask-bid)/((ask+bid)/2)*100
                     if spread>MAX_MAKER_SPREAD_PCT:log({'status':'SKIP','reason':'spread_too_wide','source':feed,'spreadPct':round(spread,4)});time.sleep(COOLDOWN_SECONDS);continue
@@ -278,6 +277,8 @@ def main():
                     side=choose_side(current,last_side);filled,current=quote_once(c,live_book,side,bid,ask,current,feed);volume+=filled
                     if filled>0:last_side=side
                     inv=current;errors=0;time.sleep(COOLDOWN_SECONDS)
+                except TradingGateClosed as e:
+                    cancel_all(c);log({'status':'WAITING_FOR_COMPETITION','reason':'trading_gate_closed','detail':str(e)[:250]});return
                 except Exception as e:
                     errors+=1;log({'event':'ENGINE_ERROR','error':str(e),'errors':errors})
                     if errors>=MAX_ERRORS:cancel_all(c);log({'status':'KILL_SWITCH','inventory':round(inv,4)});return
