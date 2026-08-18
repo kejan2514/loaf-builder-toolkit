@@ -3,8 +3,7 @@ name: Loaf League Bot - Auto Competition Engine
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/5 * 13-17 8 *'
-    - cron: '*/5 0-2 18 8 *'
+    - cron: '*/5 * * * *'
 
 permissions:
   contents: read
@@ -24,7 +23,7 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: pip install 'httpx>=0.27,<1' 'websockets>=13,<16'
-      - name: Run Round 1 maker-first hybrid volume engine
+      - name: Run competition maker-first hybrid volume engine
         env:
           LOAF_API_KEY: ${{ secrets.LOAF_API_TOKEN }}
           LOAF_API_BASE_URL: https://api.loafmarkets.com/api
